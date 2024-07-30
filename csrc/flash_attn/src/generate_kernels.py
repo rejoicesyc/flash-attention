@@ -43,13 +43,13 @@ void run_mha_bwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cu
 KERNEL_IMPL_TEMPLATE_DCA = """#include "dac_fwd_launch_template.h"
 
 template<>
-void run_dca_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{
+void run_dca_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_dca_fwd_params &params, cudaStream_t stream) {{
     run_dca_fwd_hdim{HEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
 }}
 """
 
 KERNEL_IMPL_TEMPLATE_DCA_SPLIT = """#include "dac_fwd_launch_template.h"
-template void run_dca_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_dca_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_dca_fwd_params &params, cudaStream_t stream);
 """
 
 

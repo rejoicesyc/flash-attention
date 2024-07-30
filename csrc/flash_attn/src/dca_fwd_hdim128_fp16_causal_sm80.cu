@@ -5,6 +5,6 @@
 #include "dca_fwd_launch_template.h"
 
 template<>
-void run_dca_fwd_<cutlass::half_t, 128, true>(Flash_fwd_params &params, cudaStream_t stream) {
+void run_dca_fwd_<cutlass::half_t, 128, true>(Flash_dca_fwd_params &params, cudaStream_t stream) {
     run_dca_fwd_hdim128<cutlass::half_t, true>(params, stream);
 }

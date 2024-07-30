@@ -9,14 +9,18 @@ import flash_attn_2_cuda as flash_attn_cuda
 from flash_attn.flash_attn_interface import maybe_contiguous
 
 
-def dca_varlen_func(
+def flash_dca_varlen_func(
     q,
+    q_succ,
+    q_inter,
     k,
     v,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    chunk_size,
+    local_size,
     dropout_p=0.0,
     softmax_scale=None,
     causal=True,
@@ -51,6 +55,8 @@ def dca_varlen_func(
 
     Arguments:
         q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+        q_succ: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+        q_inter: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
         k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
         v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
         cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
@@ -91,14 +97,18 @@ def dca_varlen_func(
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    q, q_succ, q_inter, k, v = [maybe_contiguous(x) for x in (q, q_succ, q_inter, k, v)]
     out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.dca_varlen(
         q,
+        q_succ,
+        q_inter,
         k,
         v,
         None,
         cu_seqlens_q,
         cu_seqlens_k,
+        chunk_size,
+        local_size,
         None, #seqused_k,
         None, #leftpad_k,
         block_table,
@@ -118,7 +128,7 @@ def dca_varlen_func(
     return out
 
 
-def dca_with_kvcache(
+def flash_dca_with_kvcache(
     q,
     k_cache,
     v_cache,

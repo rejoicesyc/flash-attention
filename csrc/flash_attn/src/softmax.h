@@ -10,6 +10,7 @@
 
 #include <cutlass/numeric_types.h>
 
+#include "cute/atom/copy_atom.hpp"
 #include "philox.cuh"
 #include "utils.h"
 
@@ -184,5 +185,57 @@ struct Softmax {
         return lse;
     };
 };
+
+template<int kNRows, typename Kernel_traits, typename TiledCopy, typename Tensor0, typename Tensor1, typename Tensor2>
+__forceinline__ __device__ void dca_softmax(TiledCopy smem_tiled_copy_O, Tensor0 &acc_o, Tensor1 &sQ_intra, Tensor1 &sQ_succ,
+                                            Tensor1 &sQ_inter, Tensor2 &lse_intra, Tensor2 &lse_succ,
+                                            Tensor2 &lse_inter, const int tidx) {
+    using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
+
+    TensorT lse_max, lse_rcp;
+    Tensor rO = make_tensor_like(acc_o);
+    Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+        float l_max = max(lse_intra(mi), lse_succ(mi));
+        lse_max(mi) = max(l_max, lse_inter(mi));
+    }
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) { 
+        float l_sum = exp2f(lse_intra(mi) - lse_max(mi));
+        l_sum += exp2f(lse_succ(mi) - lse_succ(mi));
+        l_sum += exp2f(lse_inter(mi) - lse_inter(mi));
+        lse_rcp(mi) = (l_sum == 0.f || l_sum != l_sum) ? 1.f : 1.f / l_sum;
+    }
+    // auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
+    #pragma unroll
+    for (auto &sQ : {sQ_intra, sQ_succ, sQ_inter}) {
+        Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
+        // Partition sO to match the accumulator partitioning
+        auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+        Tensor taccOrO = smem_thr_copy_O.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
+        Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
+
+        // sO has the same size as sQ, so we don't need to sync here.
+        if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
+
+        cute::copy(smem_tiled_copy_O, taccOsO, taccOrO);
+        Tensor rO_rowcol = make_tensor(rO.data(), flash::convert_layout_acc_rowcol(rO.layout()));
+
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) { 
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+                rO_rowcol(mi, ni) *= lse_intra(mi) * lse_rcp(mi);
+                acc_o_rowcol(mi, ni) += rO_rowcol(mi, ni);
+            }
+        }
+    }
+    Tensor s0 = make_tensor(sQ_intra.data(), typename Kernel_traits::SmemLayoutO{});
+    // sO has the same size as sQ, so we don't need to sync here.
+    if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
+    cute::copy(smem_tiled_copy_O, acc_o, s0);
+}
 
 }  // namespace flash

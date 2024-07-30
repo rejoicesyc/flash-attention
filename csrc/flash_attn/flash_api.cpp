@@ -153,6 +153,58 @@ void set_params_fprop(Flash_fwd_params &params,
     params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
 }
 
+void set_params_dca_fwd(Flash_dca_fwd_params &params,
+                        // sizes
+                        const size_t b,
+                        const size_t seqlen_q,
+                        const size_t seqlen_k,
+                        const size_t seqlen_q_rounded,
+                        const size_t seqlen_k_rounded,
+                        const size_t h,
+                        const size_t h_k,
+                        const size_t d,
+                        const size_t d_rounded,
+                        // device pointers
+                        const at::Tensor q,
+                        const at::Tensor q_succ,
+                        const at::Tensor q_inter,
+                        const at::Tensor k,
+                        const at::Tensor v,
+                        at::Tensor out,
+                        void *cu_seqlens_q_d,
+                        void *cu_seqlens_k_d,
+                        void *seqused_k,
+                        void *p_d,
+                        void *softmax_lse_d,
+                        float p_dropout,
+                        float softmax_scale,
+                        const int chunk_len,
+                        int window_size_left,
+                        int window_size_right,
+                        const float softcap,
+                        bool seqlenq_ngroups_swapped=false,
+                        const bool unpadded_lse=false) {
+    set_params_fprop(params,
+                     b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
+                     q, k, v, out,
+                     cu_seqlens_q_d,
+                     cu_seqlens_k_d,
+                     nullptr,
+                     nullptr,
+                     softmax_lse_d,
+                     p_dropout,
+                     softmax_scale,
+                     window_size_left,
+                     window_size_right,
+                     softcap,
+                     false, // seqlenq_ngroups_swapped
+                     unpadded_lse);
+
+    params.q_succ_ptr = q_succ.data_ptr();
+    params.q_inter_ptr = q_inter.data_ptr();
+    params.chunk_len = chunk_len;
+} 
+
 void set_params_dgrad(Flash_bwd_params &params,
                       // sizes
                       const size_t b,
@@ -317,6 +369,7 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
             params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
             params.oaccum_ptr = out_accum.data_ptr();
         }
+        std::cout << "running splitkv num = " << params.num_splits << std::endl;
         TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
     }
 
@@ -797,7 +850,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
 }
 
-void run_dca_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+void run_dca_fwd(Flash_dca_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
     FP16_SWITCH(!params.is_bf16, [&] {
         DCA_HEADDIM_SWITCH(params.d, [&] {
             if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
@@ -811,11 +864,15 @@ void run_dca_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
 
 std::vector<at::Tensor>
 dca_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               at::Tensor &q_succ,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               at::Tensor &q_inter,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                c10::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
+               const int chunk_size,
+               const int local_size,
                c10::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
                c10::optional<const at::Tensor> &leftpad_k_, // batch_size
                c10::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
@@ -852,6 +909,7 @@ dca_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(q_succ); CHECK_DEVICE(q_inter);
     CHECK_DEVICE(cu_seqlens_q);
     CHECK_DEVICE(cu_seqlens_k);
 
@@ -865,6 +923,8 @@ dca_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(q_succ.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(q_inter.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     CHECK_CONTIGUOUS(cu_seqlens_q);
@@ -895,6 +955,8 @@ dca_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size_og});
+        q_succ = q_succ.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size_og});
+        q_inter = q_inter.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size_og});
         max_seqlen_q = ngroups;
         num_heads = num_heads_k;
         cu_seqlens_q_d = nullptr;
@@ -910,6 +972,8 @@ dca_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
 
     CHECK_SHAPE(q, total_q, num_heads, head_size_og);
+    CHECK_SHAPE(q_succ, total_q, num_heads, head_size_og);
+    CHECK_SHAPE(q_inter, total_q, num_heads, head_size_og);
     if (!paged_KV) {
         const int total_k = k.size(0);
         CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
@@ -930,13 +994,17 @@ dca_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_SHAPE(seqused_k_, batch_size);
     }
 
-    at::Tensor q_padded, k_padded, v_padded;
+    at::Tensor q_padded, k_padded, v_padded, q_succ_padded, q_inter_padded;
     if (head_size_og % 8 != 0) {
         q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        q_succ_padded = torch::nn::functional::pad(q_succ, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        q_inter_padded = torch::nn::functional::pad(q_inter, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
     } else {
         q_padded = q;
+        q_succ_padded = q_succ;
+        q_inter_padded = q_inter;
         k_padded = k;
         v_padded = v;
     }
@@ -981,26 +1049,29 @@ dca_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         if (return_softmax) {p.zero_();}
     }
 
-    Flash_fwd_params params;
-    set_params_fprop(params,
-                     batch_size,
-                     max_seqlen_q, max_seqlen_k,
-                     seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
-                     head_size, head_size_rounded,
-                     q_padded, k_padded, v_padded, out,
-                     cu_seqlens_q_d,
-                     cu_seqlens_k.data_ptr(),
-                     seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
-                     return_softmax ? p.data_ptr() : nullptr,
-                     softmax_lse.data_ptr(),
-                     p_dropout,
-                     softmax_scale,
-                     window_size_left,
-                     window_size_right,
-                     softcap,
-                     seqlenq_ngroups_swapped,
-                     /*unpadded_lse*/true);
+    const int chunk_len = chunk_size - local_size;
+
+    Flash_dca_fwd_params params;
+    set_params_dca_fwd(params,                           
+                       batch_size,
+                       max_seqlen_q, max_seqlen_k,
+                       seqlen_q_rounded, seqlen_k_rounded,
+                       num_heads, num_heads_k,
+                       head_size, head_size_rounded,
+                       q_padded, q_succ_padded, q_inter_padded, k_padded, v_padded, out,
+                       cu_seqlens_q_d,
+                       cu_seqlens_k.data_ptr(),
+                       seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
+                       return_softmax ? p.data_ptr() : nullptr,
+                       softmax_lse.data_ptr(),
+                       p_dropout,
+                       softmax_scale,
+                       chunk_len,
+                       window_size_left,
+                       window_size_right,
+                       softcap,
+                       seqlenq_ngroups_swapped,
+                       /*unpadded_lse*/true);
     params.total_q = total_q;
 
     if (paged_KV) {
@@ -1710,7 +1781,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
-    Flash_fwd_params params;
+    Flash_dca_fwd_params params;
     set_params_fprop(params,
                      batch_size,
                      seqlen_q, seqlen_k,
@@ -1993,7 +2064,7 @@ dca_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
-    Flash_fwd_params params;
+    Flash_dca_fwd_params params;
     set_params_fprop(params,
                      batch_size,
                      seqlen_q, seqlen_k,

@@ -145,6 +145,15 @@ struct Flash_fwd_params : public Qkv_params {
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
 };
 
+struct Flash_dca_fwd_params: public Flash_fwd_params {
+
+    // append q_succ, q_inter for DCA
+    void *__restrict__ q_succ_ptr; 
+    void *__restrict__ q_inter_ptr; 
+
+    int chunk_len;
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Flash_bwd_params : public Flash_fwd_params {
@@ -194,5 +203,5 @@ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispa
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 
-template<typename T, int Headdim, bool Is_causal> void run_dca_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-template<typename T, int Headdim, bool Is_causal> void run_dca_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_dca_fwd_(Flash_dca_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_dca_fwd_splitkv_dispatch(Flash_dca_fwd_params &params, cudaStream_t stream);

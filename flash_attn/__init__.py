@@ -11,6 +11,6 @@ from flash_attn.flash_attn_interface import (
 )
 
 from flash_attn.dca_interface import (
-    dca_varlen_func,
-    dca_with_kvcache,
+    flash_dca_varlen_func,
+    flash_dca_with_kvcache,
 )
