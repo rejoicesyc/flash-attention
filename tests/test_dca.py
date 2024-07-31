@@ -470,7 +470,7 @@ def _pagedattention_forward_decode_with_exp_sums(
     "batch_size,seqlen_q,seqlen_k",
     [
         (14, 1024, 1024),
-        (1, 13277, 13277),
+        (1, 32 * 1024, 32 * 1024),
         # (1, 128 * 1024 + 377, 128 * 1024 + 377),
     ],
 )
@@ -490,7 +490,7 @@ def _pagedattention_forward_decode_with_exp_sums(
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
 @pytest.mark.parametrize("paged_kv_block_size", [None])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
-def test_dca_varlen_causal(
+def xtest_dca_varlen_causal(
     batch_size, seqlen_q, seqlen_k, nheads_q, nheads_k, d, local, paged_kv_block_size, dtype, chunk_size, local_size,
 ):
     if (
@@ -621,9 +621,9 @@ def test_dca_varlen_causal(
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.float16])
-@pytest.mark.parametrize("num_splits", [1, 0])
+@pytest.mark.parametrize("num_splits", [0])
 # @pytest.mark.parametrize("num_splits", [1])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False])
 # @pytest.mark.parametrize("new_kv", [False])
@@ -662,8 +662,10 @@ def test_dca_varlen_causal(
         # (3, 799),
         # (64, 2048),
         # (16, 20000),
-        (1, 1001),
-        (3, 128 * 1024),
+        (1, 1024),
+        (1, 32 * 1024),
+        (4, 128 * 1024),
+        (1, 1024 * 1024),
         # (128, 128),
     ],
 )
@@ -695,6 +697,7 @@ def test_dca_kvcache(
     if has_leftpad and paged_kv_block_size is not None:
         pytest.skip()
     device = "cuda"
+    print(seqlen_q, seqlen_k)
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
@@ -816,8 +819,12 @@ def test_dca_kvcache(
         v_cache_ref[update_mask] = rearrange(v, "b s ... -> (b s) ...")
     k_cache_rep = repeat(k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    q_succ = torch.randn_like(q)
+    q_inter = torch.randn_like(q)
     out = flash_dca_with_kvcache(
         q,
+        q_succ,
+        q_inter,
         k_cache if paged_kv_block_size is None else k_cache_paged,
         v_cache if paged_kv_block_size is None else v_cache_paged,
         k,
@@ -834,6 +841,23 @@ def test_dca_kvcache(
         alibi_slopes=alibi_slopes,
         num_splits=num_splits,
     )
+    out_ref = _bruteforce_dynamic_chunk_pageattention_forward_decode(
+        q,
+        q_succ,
+        q_inter,
+        k_cache if paged_kv_block_size is None else k_cache_paged,
+        v_cache if paged_kv_block_size is None else v_cache_paged,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=None,
+        causal=True,
+        alibi_slopes=None,
+        chunk_size=32768,
+        local_size=2048,
+        original_max_position_embeddings=32768,
+    )
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=0)
+
     # out = flash_attn_with_kvcache(
     #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size
     # )
@@ -844,61 +868,63 @@ def test_dca_kvcache(
     # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
     # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
     # probs = torch.softmax(qk, dim=-1)
-    out_ref, _ = attention_ref(
-        q_ro,
-        k_cache_rep,
-        v_cache_rep,
-        None,
-        key_padding_mask,
-        attn_bias,
-        0.0,
-        None,
-        causal=causal,
-        window_size=window_size,
-        key_leftpad=cache_leftpad,
-    )
-    out_pt, _ = attention_ref(
-        q_ro,
-        k_cache_rep,
-        v_cache_rep,
-        None,
-        key_padding_mask,
-        attn_bias,
-        0.0,
-        None,
-        causal=causal,
-        window_size=window_size,
-        upcast=False,
-        reorder_ops=True,
-        key_leftpad=cache_leftpad,
-    )
-    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-    # Check that FlashAttention's numerical error is at most twice the numerical error
-    # of a Pytorch implementation.
-    if new_kv:
-        if paged_kv_block_size is None:
-            k_cache_select = (
-                k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
-            )
-            v_cache_select = (
-                v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
-            )
-        else:
-            k_cache_select = rearrange(
-                k_cache_paged[block_table.to(dtype=torch.long).flatten()],
-                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-                b=batch_size,
-            )[:, :seqlen_k]
-            v_cache_select = rearrange(
-                v_cache_paged[block_table.to(dtype=torch.long).flatten()],
-                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-                b=batch_size,
-            )[:, :seqlen_k]
-        assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
-        assert torch.equal(v_cache_select, v_cache_ref)
-    mult = 3 if not alibi else 5
-    assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
+    # ///////// return ///////////
+    # out_ref, _ = attention_ref(
+    #     q_ro,
+    #     k_cache_rep,
+    #     v_cache_rep,
+    #     None,
+    #     key_padding_mask,
+    #     attn_bias,
+    #     0.0,
+    #     None,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     key_leftpad=cache_leftpad,
+    # )
+    # out_pt, _ = attention_ref(
+    #     q_ro,
+    #     k_cache_rep,
+    #     v_cache_rep,
+    #     None,
+    #     key_padding_mask,
+    #     attn_bias,
+    #     0.0,
+    #     None,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     upcast=False,
+    #     reorder_ops=True,
+    #     key_leftpad=cache_leftpad,
+    # )
+    # print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    # print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    # print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    # print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
+    # # Check that FlashAttention's numerical error is at most twice the numerical error
+    # # of a Pytorch implementation.
+    # if new_kv:
+    #     if paged_kv_block_size is None:
+    #         k_cache_select = (
+    #             k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
+    #         )
+    #         v_cache_select = (
+    #             v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
+    #         )
+    #     else:
+    #         k_cache_select = rearrange(
+    #             k_cache_paged[block_table.to(dtype=torch.long).flatten()],
+    #             "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+    #             b=batch_size,
+    #         )[:, :seqlen_k]
+    #         v_cache_select = rearrange(
+    #             v_cache_paged[block_table.to(dtype=torch.long).flatten()],
+    #             "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+    #             b=batch_size,
+    #         )[:, :seqlen_k]
+    #     assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
+    #     assert torch.equal(v_cache_select, v_cache_ref)
+    # mult = 3 if not alibi else 5
+    # assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5

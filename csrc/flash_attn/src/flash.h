@@ -137,6 +137,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_rotary_interleaved;
 
     int num_splits;  // For split-KV version
+    // Especially, we have num_splits = num_split_kv_inter + 1(intra) + 1(succ) for flash DCA,
 
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
@@ -152,6 +153,7 @@ struct Flash_dca_fwd_params: public Flash_fwd_params {
     void *__restrict__ q_inter_ptr; 
 
     int chunk_len;
+    int num_n_chunk_blocks;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

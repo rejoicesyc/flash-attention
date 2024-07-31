@@ -130,8 +130,12 @@ def flash_dca_varlen_func(
 
 def flash_dca_with_kvcache(
     q,
+    q_succ,
+    q_inter,
     k_cache,
     v_cache,
+    chunk_size,
+    local_size,
     k=None,
     v=None,
     rotary_cos=None,
@@ -242,7 +246,7 @@ def flash_dca_with_kvcache(
     assert softcap == 0., "do not support softcap attn"
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    q, q_succ, q_inter, k, v = [maybe_contiguous(x) for x in (q, q_succ, q_inter, k, v)]
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
@@ -254,8 +258,12 @@ def flash_dca_with_kvcache(
     block_table = maybe_contiguous(block_table)
     out, softmax_lse = flash_attn_cuda.dca_kvcache(
         q,
+        q_succ,
+        q_inter,
         k_cache,
         v_cache,
+        chunk_size,
+        local_size,
         k,
         v,
         cache_seqlens,

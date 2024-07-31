@@ -209,13 +209,13 @@ __forceinline__ __device__ void dca_softmax(TiledCopy smem_tiled_copy_O, Tensor0
         lse_rcp(mi) = (l_sum == 0.f || l_sum != l_sum) ? 1.f : 1.f / l_sum;
     }
     // auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
+    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
     #pragma unroll
     for (auto &sQ : {sQ_intra, sQ_succ, sQ_inter}) {
         Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
         // Partition sO to match the accumulator partitioning
-        auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
-        Tensor taccOrO = smem_thr_copy_O.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
-        Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
+        Tensor taccOsO = smem_thr_copy_O.partition_S(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
+        Tensor taccOrO = smem_thr_copy_O.retile_D(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
 
         // sO has the same size as sQ, so we don't need to sync here.
         if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
@@ -232,10 +232,12 @@ __forceinline__ __device__ void dca_softmax(TiledCopy smem_tiled_copy_O, Tensor0
             }
         }
     }
-    Tensor s0 = make_tensor(sQ_intra.data(), typename Kernel_traits::SmemLayoutO{});
+    Tensor sO = make_tensor(sQ_intra.data(), typename Kernel_traits::SmemLayoutO{});
+    Tensor taccOrO = smem_thr_copy_O.retile_S(acc_o);
+    Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
     // sO has the same size as sQ, so we don't need to sync here.
     if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
-    cute::copy(smem_tiled_copy_O, acc_o, s0);
+    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 }
 
 }  // namespace flash

@@ -489,7 +489,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const int n_block_max_intra = n_block_max;
     const int n_block_min_intra = (((m_block * kBlockM) / chunk_len) * chunk_len) / kBlockN;
     const int n_block_max_succ = n_block_min_intra;
-    const int n_block_min_succ = n_block_max_succ - min(n_block_max_succ, chunk_len);
+    const int n_block_min_succ = n_block_max_succ - min(n_block_max_succ, chunk_len) / kBlockN;
     const int n_block_max_inter = n_block_min_succ;
     const int n_block_min_inter = 0;
 
@@ -595,11 +595,26 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
-    const int n_block_min = !Is_local
-        ? n_split_idx * n_blocks_per_split
-        : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
-    int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
+    const int chunk_len = params.chunk_len;
+    const int twice_chunk_len = chunk_len + chunk_len;
+    const bool is_intra = n_split_idx == (num_n_splits - 1);
+    const bool is_succ = n_split_idx == (num_n_splits - 2);
+    const bool is_inter = (!is_intra) && (!is_succ);
+
+    // as a matter of fact, we won't have casual or local for DCA
+    int n_block_min, n_block_max;
+    if (is_inter) {
+        const int num_n_inter_split = num_n_splits - 2;
+        const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1 - twice_chunk_len) / kBlockN + num_n_inter_split - 1) / num_n_inter_split;
+        n_block_min = n_split_idx * n_blocks_per_split;
+        n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k - twice_chunk_len, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
+    } else if (is_succ) {
+        n_block_min = cute::ceil_div(binfo.actual_seqlen_k - twice_chunk_len, kBlockN);
+        n_block_max = cute::ceil_div(binfo.actual_seqlen_k - chunk_len, kBlockN);
+    } else {
+        n_block_min = cute::ceil_div(binfo.actual_seqlen_k - chunk_len, kBlockN);
+        n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+    }
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
@@ -663,7 +678,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
           + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
         : block_table[block_table_idx] * params.v_batch_stride + block_table_offset * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
-    Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
+    void *q_ptr;
+    if (is_intra) {
+        q_ptr = params.q_ptr;
+    } else if (is_succ) {
+        q_ptr = params.q_succ_ptr;
+    } else {
+        q_ptr = params.q_inter_ptr;
+    }
+    Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
                             make_stride(params.q_row_stride, params.q_head_stride, _1{}));
     Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -1248,7 +1271,7 @@ inline __device__ void combine_dca_seqk_parallel(const Params &params) {
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
         const int col = tidx / kRowsPerLoadTranspose;
-        lse_accum(l) = (row < kMaxSplits && col < kBlockM) ? sLSE[row][col] : -INFINITY;
+        lse_accum(l) = (row < /*kMaxSplits*/ params.num_splits - 2/* skip succ & intra chunk lse */ && col < kBlockM) ? sLSE[row][col] : -INFINITY;
         // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse_accum(l)); }
     }
 
@@ -1283,7 +1306,7 @@ inline __device__ void combine_dca_seqk_parallel(const Params &params) {
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
         const int col = tidx / kRowsPerLoadTranspose;
-        if (row < params.num_splits && col < kBlockM) { sLSE[row][col] = expf(lse_accum(l) - lse_logsum); }
+        if (row < params.num_splits - 2 /* skip succ & intra chunk lse */ && col < kBlockM) { sLSE[row][col] = expf(lse_accum(l) - lse_logsum); }
     }
     __syncthreads();
 
@@ -1314,7 +1337,7 @@ inline __device__ void combine_dca_seqk_parallel(const Params &params) {
         for (int k = 0; k < size(tOpOaccum); ++k) { tOpOaccum(k) = get<1>(tOcOaccum(0, 0, k)) < params.d; }
     }
     // Load Oaccum in then scale and accumulate to O
-    for (int split = 0; split < params.num_splits; ++split) {
+    for (int split = 0; split < params.num_splits - 2; ++split) {
         flash::copy</*Is_even_MN=*/false, Is_even_K>(
             gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
         );
@@ -1334,6 +1357,38 @@ inline __device__ void combine_dca_seqk_parallel(const Params &params) {
         tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
     }
     // if (cute::thread0()) { print_tensor(tOrO); }
+
+    // DCA softmax
+    for (int split = params.num_splits - 3, is_first = 1; split < params.num_splits; ++split) {
+        if (is_first) {
+            flash::copy</*Is_even_MN=*/false, Is_even_K>(
+                gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
+            );
+        }
+        #pragma unroll
+        for (int m = 0; m < size<1>(tOrOaccum); ++m) {
+            int row = get<0>(tOcOaccum(0, m, 0));
+            ElementAccum lse_inter = lse_logsum;
+            ElementAccum lse_succ = sLSE[params.num_splits - 2][row];
+            ElementAccum lse_intra = sLSE[params.num_splits - 1][row];
+            ElementAccum dca_lse_max = max(lse_inter, max(lse_succ, lse_intra));
+            ElementAccum lse_scale = 1. / (expf(lse_intra - dca_lse_max) + expf(lse_succ - dca_lse_max) + expf(lse_inter - dca_lse_max));
+            #pragma unroll
+            for (int k = 0; k < size<2>(tOrOaccum); ++k) {
+                #pragma unroll
+                for (int i = 0; i < size<0>(tOrOaccum); ++i) {
+                    if (is_first) {
+                        tOrO(i, m, k) *= lse_scale;
+                    } else {
+                        tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
+                    }
+                }
+            }
+        // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
+        }
+        tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
+        is_first = 0;
+    }
 
     Tensor rO = flash::convert_type<Element>(tOrO);
     // Write to gO

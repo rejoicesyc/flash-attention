@@ -369,7 +369,46 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
             params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
             params.oaccum_ptr = out_accum.data_ptr();
         }
-        std::cout << "running splitkv num = " << params.num_splits << std::endl;
+        TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
+    }
+
+    return std::make_tuple(softmax_lse_accum, out_accum);
+}
+
+std::tuple<at::Tensor, at::Tensor> set_params_dca_splitkv(Flash_dca_fwd_params &params, const int batch_size,
+    const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
+    const int head_size_rounded, const float p_dropout,
+    const int num_splits, cudaDeviceProp *dprops, struct c10::TensorOptions opts) {
+
+    // This needs to match with run_mha_fwd_splitkv_dispatch
+    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+
+    const int chunk_len = params.chunk_len;
+    TORCH_CHECK(chunk_len % block_n == 0, "chunk_len(chunk_size-local_size) must be divided by block_n:" + std::to_string(block_n));
+
+    // we only apply splitkv for inter chunk, and use extra blocks for succ & intra chunk which is ralatively small
+    const int intra_succ_length = chunk_len + chunk_len;
+    TORCH_CHECK(max_seqlen_k > intra_succ_length, "too small kv seqlen for DCA, need at least 2 * chunk_len (chunk_size - local_size)");
+    const int inter_num_n_blocks = (max_seqlen_k + block_n - 1 - intra_succ_length) / block_n;
+    // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
+    // In any case we don't expect seqlen_q to be larger than 64 for inference.
+    const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
+    params.num_splits = num_splits;
+    at::Tensor softmax_lse_accum;
+    at::Tensor out_accum;
+
+    if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
+        if (num_splits < 1) {
+            // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
+            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount * 2, inter_num_n_blocks, 128) 
+                                + 2 /* for succ chunk and intra chunk */;
+        }
+        if (params.num_splits > 1) {
+            softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+            out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+            params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+            params.oaccum_ptr = out_accum.data_ptr();
+        }
         TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
     }
 
@@ -1927,9 +1966,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 }
 
 std::vector<at::Tensor>
-dca_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
+dca_fwd_kvcache(at::Tensor &q,                       // batch_size x seqlen_q x num_heads x head_size
+                at::Tensor &q_succ,                  // batch_size x seqlen_q x num_heads x head_size
+                at::Tensor &q_inter,                 // batch_size x seqlen_q x num_heads x head_size
                 const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+                const int chunk_size,
+                const int local_size,
                 c10::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
                 c10::optional<const at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
                 c10::optional<const at::Tensor> &seqlens_k_, // batch_size
@@ -1963,12 +2006,17 @@ dca_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (q_dtype == torch::kBFloat16) {
         TORCH_CHECK(is_sm90 || is_sm8x, "bfloat16 is only supported on Ampere GPUs or newer");
     }
+    TORCH_CHECK(q_succ.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(q_inter.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
+    CHECK_DEVICE(q_succ); CHECK_DEVICE(q_inter);
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(q_succ.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(q_inter.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(kcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(vcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
@@ -2010,6 +2058,8 @@ dca_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (seqlenq_ngroups_swapped) {
         const int ngroups = num_heads / num_heads_k;
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
+        q_succ = q_succ.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
+        q_inter = q_inter.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
         seqlen_q = ngroups;
         num_heads = num_heads_k;
     }
@@ -2018,6 +2068,8 @@ dca_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
+    CHECK_SHAPE(q_succ, batch_size, seqlen_q, num_heads, head_size_og);
+    CHECK_SHAPE(q_inter, batch_size, seqlen_q, num_heads, head_size_og);
     if (!paged_KV) {
         CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
         CHECK_SHAPE(vcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
@@ -2027,13 +2079,17 @@ dca_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
-    at::Tensor q_padded, kcache_padded, vcache_padded;
+    at::Tensor q_padded, kcache_padded, vcache_padded, q_succ_padded, q_inter_padded;
     if (head_size_og % 8 != 0) {
         q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        q_succ_padded = torch::nn::functional::pad(q_succ, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
+        q_inter_padded = torch::nn::functional::pad(q_inter, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         kcache_padded = torch::nn::functional::pad(kcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
         vcache_padded = torch::nn::functional::pad(vcache, torch::nn::functional::PadFuncOptions({0, 8 - head_size_og % 8}));
     } else {
         q_padded = q;
+        q_succ_padded = q_succ;
+        q_inter_padded = q_inter;
         kcache_padded = kcache;
         vcache_padded = vcache;
     }
@@ -2064,25 +2120,28 @@ dca_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
+    const int chunk_len = chunk_size - local_size;
+
     Flash_dca_fwd_params params;
-    set_params_fprop(params,
-                     batch_size,
-                     seqlen_q, seqlen_k,
-                     seqlen_q_rounded, seqlen_k_rounded,
-                     num_heads, num_heads_k,
-                     head_size, head_size_rounded,
-                     q_padded, kcache_padded, vcache_padded, out,
-                     /*cu_seqlens_q_d=*/nullptr,
-                     /*cu_seqlens_k_d=*/nullptr,
-                     /*seqused_k=*/nullptr,
-                     /*p_ptr=*/nullptr,
-                     softmax_lse.data_ptr(),
-                     /*p_dropout=*/0.f,
-                     softmax_scale,
-                     window_size_left,
-                     window_size_right,
-                     softcap
-                     );
+    set_params_dca_fwd(params,
+                       batch_size,
+                       seqlen_q, seqlen_k,
+                       seqlen_q_rounded, seqlen_k_rounded,
+                       num_heads, num_heads_k,
+                       head_size, head_size_rounded,
+                       q_padded, q_succ_padded, q_inter_padded, kcache_padded, vcache_padded, out,
+                       /*cu_seqlens_q_d=*/nullptr,
+                       /*cu_seqlens_k_d=*/nullptr,
+                       /*seqused_k=*/nullptr,
+                       /*p_ptr=*/nullptr,
+                       softmax_lse.data_ptr(),
+                       /*p_dropout=*/0.f,
+                       softmax_scale,
+                       chunk_len,
+                       window_size_left,
+                       window_size_right,
+                       softcap
+                       );
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
@@ -2173,7 +2232,7 @@ dca_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
-    std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
+    std::tie(softmax_lse_accum, out_accum) = set_params_dca_splitkv(
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
         head_size_rounded, /*dropout*/ 0.f, num_splits, dprops, opts);
 
