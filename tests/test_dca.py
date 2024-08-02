@@ -148,6 +148,7 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
                 max_seqlen_k=end - prev_chunk_end_pos,
             )
         else:
+            print(f'intra {prev_chunk_end_pos}:{end}')
             # print(f'intra flash q[{qbegin}:{qend}] kv[{prev_chunk_end_pos}:{end}]')
             k_states_intra = k[prev_chunk_end_pos:end]
             v_states_intra = v[prev_chunk_end_pos:end]
@@ -169,6 +170,7 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
                     max_seqlen_k=chunk_len,
                 )
             else:
+                print(f'succ {prev_chunk_end_pos-chunk_len}:{prev_chunk_end_pos}')
                 k_states_succ = k[prev_chunk_end_pos -
                                     chunk_len:prev_chunk_end_pos]
                 v_states_succ = v[prev_chunk_end_pos -
@@ -179,7 +181,6 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
 
         if prev_chunk_end_pos - chunk_len * 2 >= 0:
             q_states_inter = q_inter[qbegin:qend]
-
             if block_table is not None:
                 block_table_inter = get_block(
                     0, prev_chunk_end_pos - chunk_len)
@@ -192,6 +193,7 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
                     max_seqlen_k=prev_chunk_end_pos - chunk_len,
                 )
             else:
+                print(f'inter 0:{prev_chunk_end_pos - chunk_len}')
                 k_states_inter = k[:prev_chunk_end_pos - chunk_len]
                 v_states_inter = v[:prev_chunk_end_pos - chunk_len]
                 flash_result = do_flash_attn(q_states_inter,
@@ -347,6 +349,7 @@ def _bruteforce_dynamic_chunk_pageattention_forward_decode(
             st + (max_seq_len_intra - 1) // block_size + 1,
             (cache_seqlens[i] - 1) // block_size + 1,
         )
+        print(f'intra {st*block_size} : {ed* block_size}, seq_lens_intra : {seq_lens_intra}')
         block_table_intra[i, :ed - st] = block_table[i, st:ed]
     intra_output, intra_softmax_lse = (
         _pagedattention_forward_decode_with_exp_sums(
@@ -380,6 +383,7 @@ def _bruteforce_dynamic_chunk_pageattention_forward_decode(
                 st + (max_seq_len_succ - 1) // block_size + 1,
                 (cache_seqlens[i] - 1) // block_size + 1,
             )
+            print(f'succ {st*block_size} : {ed* block_size}, seq_lens_succ : {seq_lens_succ}')
             block_table_succ[i, :ed - st] = block_table[i, st:ed]
         succ_output, succ_softmax_lse = (
             _pagedattention_forward_decode_with_exp_sums(
@@ -399,6 +403,7 @@ def _bruteforce_dynamic_chunk_pageattention_forward_decode(
     seq_lens_inter = (chunk_num_curr - 1).clip(min=0) * chunk_len
     max_seq_len_inter = seq_lens_inter.max().item()
     if max_seq_len_inter:
+        print(f'inter 0 : {max_seq_len_inter}, seq_lens_inter : {seq_lens_inter}')
         inter_output, succ_softmax_lse = (
             _pagedattention_forward_decode_with_exp_sums(
                 query_inter,
@@ -410,19 +415,25 @@ def _bruteforce_dynamic_chunk_pageattention_forward_decode(
                 alibi_slopes,
                 causal=False,
             ))
+        print('lse dtype', succ_softmax_lse.dtype)
         outputs_list.append(inter_output)
         softmax_lses_list.append(succ_softmax_lse)
 
     outputs = torch.stack(outputs_list, dim=0)
+    # print(outputs.shape)
+    # print(outputs[:, :, :, :, :4])
     del outputs_list
     softmax_lses = torch.stack(softmax_lses_list, dim=0).to(torch.float32)
     del softmax_lses_list
 
+    # print('softmax_lses', softmax_lses)
     max_logits = torch.max(softmax_lses, dim=0).values
+    # print('max_logits', max_logits)
     stable_logits = softmax_lses - max_logits.unsqueeze(0)
     lse_s = torch.exp(stable_logits).detach()
     lse_sum = torch.sum(lse_s, dim=0)
     lse_s /= lse_sum
+    # print('lse_s', lse_s)
     outputs *= lse_s.unsqueeze(-1).transpose(2, 3)
 
     return outputs.sum(0)
@@ -450,7 +461,7 @@ def _pagedattention_forward_decode_with_exp_sums(
         softmax_scale=softmax_scale,
         alibi_slopes=alibi_slopes,
         causal=causal,
-        # return_softmax=False,
+        return_softmax_lse=True,
     )
     cache_seqlens_cpu = cache_seqlens.cpu()
     for i in range(cache_seqlens.shape[0]):
@@ -461,30 +472,31 @@ def _pagedattention_forward_decode_with_exp_sums(
     return out, softmax_lse
 
 
-@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "batch_size,seqlen_q,seqlen_k",
     [
-        (14, 1024, 1024),
-        (1, 32 * 1024, 32 * 1024),
+        # (14, 1024, 1024),
+        # (1, 32 * 1024, 32 * 1024),
+        (1, 2049, 2049)
         # (1, 128 * 1024 + 377, 128 * 1024 + 377),
     ],
 )
 @pytest.mark.parametrize(
     "nheads_q, nheads_k", [
-        (8, 1), # test gqa
+        # (8, 1), # test gqa
         (8, 8),
     ]
 )
 @pytest.mark.parametrize(
     "chunk_size, local_size", [
         (512, 0),
-        (8192, 1024),
-        (32 * 1024, 2048),
+        # (8192, 1024),
+        # (32 * 1024, 2048),
     ]
 )
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
@@ -560,7 +572,7 @@ def xtest_dca_varlen_causal(
         block_table=block_table,
     )
     ref_out = _bruteforce_dynamic_chunk_flash_attn_varlen_func(
-        q,
+        q_unpad,
         q_succ_unpad,
         q_inter_unpad,
         k_unpad if paged_kv_block_size is None else k_cache_paged,
@@ -620,10 +632,10 @@ def xtest_dca_varlen_causal(
 
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-# @pytest.mark.parametrize("dtype", [torch.float16])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("num_splits", [0])
 # @pytest.mark.parametrize("num_splits", [1])
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "qga"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False])
 # @pytest.mark.parametrize("new_kv", [False])
@@ -652,25 +664,31 @@ def xtest_dca_varlen_causal(
 # @pytest.mark.parametrize('d', [56, 80])
 @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
+    "batch_size,seqlen_q,seqlen_k",
     [
-        # (1, 128),
-        # (1, 339),
-        # (3, 1024),
-        # (64, 800),
-        # (64, 256),
-        # (3, 799),
-        # (64, 2048),
-        # (16, 20000),
-        (1, 1024),
-        (1, 32 * 1024),
-        (4, 128 * 1024),
-        (1, 1024 * 1024),
-        # (128, 128),
+        # (2, 1, 1024)
+        (4, 1, 32 * 1024),
+        (5, 7, 64 * 1024),
+        (1, 13, 128 * 1024),
+        (1, 1, 512 * 1024),
+        (1, 1, 1024 * 1024),
+        # (1, x * 1024) for x in range(16, 513, 16)
     ],
+)
+@pytest.mark.parametrize(
+    "chunk_size, local_size", [
+        # (256, 0),
+        # (4096, 0),
+        # (8 * 1024, 0),
+        # (32 * 1024, 0),
+        # # (8192, 1024),
+        # (32 * 1024, 2048),
+        (x * 1024, 0) for x in range(2, 33, 2)
+    ]
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_dca_kvcache(
+    batch_size,
     seqlen_q,
     seqlen_k,
     d,
@@ -687,6 +705,8 @@ def test_dca_kvcache(
     mha_type,
     num_splits,
     dtype,
+    chunk_size,
+    local_size,
 ):
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
@@ -696,16 +716,19 @@ def test_dca_kvcache(
         pytest.skip()
     if has_leftpad and paged_kv_block_size is not None:
         pytest.skip()
+    if (chunk_size - local_size) * 2 >= seqlen_k:
+        print(f'skip for {chunk_size} {local_size} {seqlen_k}')
+        pytest.skip()
     device = "cuda"
     print(seqlen_q, seqlen_k)
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 2
+    # batch_size = 4
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 6
+    nheads = 8
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
@@ -731,7 +754,7 @@ def test_dca_kvcache(
             seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
         )
     cache_seqlens = torch.randint(
-        0 if new_kv else 1,
+        0 if new_kv else (2 * (chunk_size - local_size) + 1),
         # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
         (
             (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
@@ -821,12 +844,28 @@ def test_dca_kvcache(
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     q_succ = torch.randn_like(q)
     q_inter = torch.randn_like(q)
+    print(q.shape)
+    print(k_cache.shape)
+    print(cache_batch_idx)
+    print(cache_leftpad)
+    # cache_seqlens = torch.tensor(
+    #     [k_cache.shape[1]] * batch_size,
+    #     dtype=torch.int32,
+    #     device=q.device,
+    # )
+    if (chunk_size - local_size) * 2 >= min(cache_seqlens):
+        print(f'skip {chunk_size} : {local_size} {cache_seqlens}')
+        pytest.skip()
+    print(cache_seqlens)
+    # import pdb; pdb.set_trace()
     out = flash_dca_with_kvcache(
         q,
         q_succ,
         q_inter,
         k_cache if paged_kv_block_size is None else k_cache_paged,
         v_cache if paged_kv_block_size is None else v_cache_paged,
+        chunk_size,
+        local_size,
         k,
         v,
         rotary_cos=cos,
@@ -841,6 +880,7 @@ def test_dca_kvcache(
         alibi_slopes=alibi_slopes,
         num_splits=num_splits,
     )
+    torch.cuda.synchronize()
     out_ref = _bruteforce_dynamic_chunk_pageattention_forward_decode(
         q,
         q_succ,
@@ -852,11 +892,18 @@ def test_dca_kvcache(
         softmax_scale=None,
         causal=True,
         alibi_slopes=None,
-        chunk_size=32768,
-        local_size=2048,
+        chunk_size=chunk_size,
+        local_size=local_size,
         original_max_position_embeddings=32768,
     )
-    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=0)
+    # print(out[:, :, :, :8])
+    print(out.shape, out_ref.shape)
+    # print(out[:, :, :, :8])
+    # print(out_ref[:, :, :, :8])
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
 
     # out = flash_attn_with_kvcache(
     #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size

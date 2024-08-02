@@ -210,8 +210,13 @@ __forceinline__ __device__ void dca_softmax(TiledCopy smem_tiled_copy_O, Tensor0
     }
     // auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor1 vec_sQ[3] = {sQ_intra, sQ_succ, sQ_inter};
+    Tensor2 vec_lse[3] = {lse_intra, lse_succ, lse_inter};
     #pragma unroll
-    for (auto &sQ : {sQ_intra, sQ_succ, sQ_inter}) {
+    for (int i = 0; i < 3; ++i) {
+        auto sQ = vec_sQ[i];
+        auto lse = vec_lse[i];
+
         Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
         // Partition sO to match the accumulator partitioning
         Tensor taccOsO = smem_thr_copy_O.partition_S(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
@@ -227,8 +232,14 @@ __forceinline__ __device__ void dca_softmax(TiledCopy smem_tiled_copy_O, Tensor0
         for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) { 
             #pragma unroll
             for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-                rO_rowcol(mi, ni) *= lse_intra(mi) * lse_rcp(mi);
+                rO_rowcol(mi, ni) *= lse(mi) * lse_rcp(mi);
                 acc_o_rowcol(mi, ni) += rO_rowcol(mi, ni);
+                // if (cute::thread0()) {
+                //     print(lse);
+                //     print(lse_rcp);
+                //     print(rO_rowcol);
+                //     print(acc_o_rowcol);
+                // }
             }
         }
     }

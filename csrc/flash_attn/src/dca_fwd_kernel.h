@@ -596,25 +596,42 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
     const int chunk_len = params.chunk_len;
-    const int twice_chunk_len = chunk_len + chunk_len;
     const bool is_intra = n_split_idx == (num_n_splits - 1);
     const bool is_succ = n_split_idx == (num_n_splits - 2);
     const bool is_inter = (!is_intra) && (!is_succ);
 
     // as a matter of fact, we won't have casual or local for DCA
     int n_block_min, n_block_max;
+    const int actual_seqlen_k_intra_begin = ((binfo.actual_seqlen_k - 1) / chunk_len) * chunk_len;
+    const int actual_seqlen_k_succ_begin = actual_seqlen_k_intra_begin - chunk_len;
     if (is_inter) {
         const int num_n_inter_split = num_n_splits - 2;
-        const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1 - twice_chunk_len) / kBlockN + num_n_inter_split - 1) / num_n_inter_split;
+        const int n_blocks_per_split = ((actual_seqlen_k_succ_begin + kBlockN - 1) / kBlockN + num_n_inter_split - 1) / num_n_inter_split;
+        // if (cute::thread0()) { 
+        //     printf("inter n_blocks_per_split:%d length:%d\n", 
+        //            n_blocks_per_split, actual_seqlen_k_succ_begin); 
+        // }
         n_block_min = n_split_idx * n_blocks_per_split;
-        n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k - twice_chunk_len, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
+        n_block_max = std::min(cute::ceil_div(actual_seqlen_k_succ_begin, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
     } else if (is_succ) {
-        n_block_min = cute::ceil_div(binfo.actual_seqlen_k - twice_chunk_len, kBlockN);
-        n_block_max = cute::ceil_div(binfo.actual_seqlen_k - chunk_len, kBlockN);
+        n_block_min = cute::ceil_div(actual_seqlen_k_succ_begin, kBlockN);
+        n_block_max = cute::ceil_div(actual_seqlen_k_intra_begin, kBlockN);
+        // if (tidx == 0) {
+        //     printf("succ [%d:%d]\n", actual_seqlen_k_succ_begin, 
+        //            actual_seqlen_k_intra_begin);
+        // }
     } else {
-        n_block_min = cute::ceil_div(binfo.actual_seqlen_k - chunk_len, kBlockN);
+        n_block_min = cute::ceil_div(actual_seqlen_k_intra_begin, kBlockN);
         n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+        // if (tidx == 0) {
+        //     printf("intra [%d:%d]\n", actual_seqlen_k_intra_begin, 
+        //             binfo.actual_seqlen_k);
+        // }
     }
+    // if (tidx == 0) {
+    //     printf("num_split:%d, n_split_idx:%d, is_intra:%d, is_succ:%d, is_inter:%d, n_block_min %d, n_block_max %d\n", 
+    //            num_n_splits, n_split_idx, is_intra, is_succ, is_inter, n_block_min, n_block_max);
+    // }
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
@@ -1218,6 +1235,7 @@ inline __device__ void combine_dca_seqk_parallel(const Params &params) {
     // Shared memory.
     // kBlockM + 1 instead of kBlockM to reduce bank conflicts.
     __shared__ ElementAccum sLSE[kMaxSplits][kBlockM + 1];
+    __shared__ ElementAccum sLSE_inter[kBlockM];
 
     // The thread and block index.
     const int tidx = threadIdx.x;
@@ -1296,11 +1314,14 @@ inline __device__ void combine_dca_seqk_parallel(const Params &params) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
             if (lse_offset < lse_size) {
                 gLSE_unpadded(lse_offset) = lse_logsum;
+                sLSE_inter[tidx / kRowsPerLoadTranspose] = lse_logsum;
             }
         } else {
             gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
+            sLSE_inter[tidx / kRowsPerLoadTranspose] = lse_logsum;
         }
     }
+    __syncthreads();
     // Store the scales exp(lse - lse_logsum) in shared memory.
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
@@ -1359,8 +1380,13 @@ inline __device__ void combine_dca_seqk_parallel(const Params &params) {
     // if (cute::thread0()) { print_tensor(tOrO); }
 
     // DCA softmax
+    // if (cute::thread0()) {
+    //     printf("loop tidx[%d] num_splits:%d size<1>(tOrOaccum):%d size<2>(tOrOaccum):%d size<0>(tOrOaccum):%d\n", 
+    //            tidx, params.num_splits, static_cast<int>(size<1>(tOrOaccum)), static_cast<int>(size<2>(tOrOaccum)), static_cast<int>(size<0>(tOrOaccum)));
+    // }
+    
     for (int split = params.num_splits - 3, is_first = 1; split < params.num_splits; ++split) {
-        if (is_first) {
+        if (!is_first) {
             flash::copy</*Is_even_MN=*/false, Is_even_K>(
                 gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
             );
@@ -1368,25 +1394,46 @@ inline __device__ void combine_dca_seqk_parallel(const Params &params) {
         #pragma unroll
         for (int m = 0; m < size<1>(tOrOaccum); ++m) {
             int row = get<0>(tOcOaccum(0, m, 0));
-            ElementAccum lse_inter = lse_logsum;
+            ElementAccum lse_inter = sLSE_inter[row];
             ElementAccum lse_succ = sLSE[params.num_splits - 2][row];
             ElementAccum lse_intra = sLSE[params.num_splits - 1][row];
             ElementAccum dca_lse_max = max(lse_inter, max(lse_succ, lse_intra));
-            ElementAccum lse_scale = 1. / (expf(lse_intra - dca_lse_max) + expf(lse_succ - dca_lse_max) + expf(lse_inter - dca_lse_max));
+            lse_inter = expf(lse_inter - dca_lse_max);
+            lse_succ = expf(lse_succ - dca_lse_max);
+            lse_intra = expf(lse_intra - dca_lse_max);
+            ElementAccum lse_sum = 1. / (lse_inter + lse_succ + lse_intra);
+            // if (is_first && tidx % 16 == 0) {
+            //     printf("post softmax [%d] lse_inter: %f, lse_succ: %f, lse_intra %f\n", bidx, lse_inter, lse_succ, lse_intra);
+            // }
             #pragma unroll
             for (int k = 0; k < size<2>(tOrOaccum); ++k) {
                 #pragma unroll
                 for (int i = 0; i < size<0>(tOrOaccum); ++i) {
                     if (is_first) {
-                        tOrO(i, m, k) *= lse_scale;
+                        ElementAccum lse_scale = lse_inter * lse_sum;
+                        Element acc_ele = static_cast<Element>(tOrO(i, m, k));
+                        // if (bidx == 0 && tidx % 16 == 0) { 
+                        //     printf("[%d] inter acc(%d, %d, %d) acc(%f) * lse(%f) = acc(%f)\n", 
+                        //            bidx, i, m, k, static_cast<ElementAccum>(acc_ele), lse_scale, static_cast<ElementAccum>(acc_ele * lse_scale)); 
+                        // }
+                        tOrO(i, m, k) = acc_ele * lse_scale;
                     } else {
-                        tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
+                        ElementAccum lse_scale = ((split == params.num_splits - 1) ? lse_intra : lse_succ) * lse_sum;
+                        Element acc_ele = static_cast<Element>(tOrOaccum(i, m, k));
+                        tOrO(i, m, k) += acc_ele * lse_scale;
+                        // if (bidx == 0 && tidx % 16 == 0) { 
+                        //     printf("[%d] %s acc(%d, %d, %d) acc:(%f) * lse:(%f) = (%f)\n", 
+                        //             bidx, (split == params.num_splits - 1) ? "intra" : "succ",
+                        //             i, m, k, static_cast<ElementAccum>(acc_ele), lse_scale, tOrO(i, m, k)); 
+                        // }
                     }
                 }
             }
         // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
         }
-        tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
+        if (!is_first) {
+            tOgOaccum.data() = tOgOaccum.data() + params.b * params.h * params.seqlen_q * params.d_rounded;
+        }
         is_first = 0;
     }
 

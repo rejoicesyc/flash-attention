@@ -246,6 +246,7 @@ def flash_dca_with_kvcache(
     assert softcap == 0., "do not support softcap attn"
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    assert (chunk_size - local_size) * 2 <= min(cache_seqlens), "too small chunk_len for kvcache_len"
     q, q_succ, q_inter, k, v = [maybe_contiguous(x) for x in (q, q_succ, q_inter, k, v)]
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)

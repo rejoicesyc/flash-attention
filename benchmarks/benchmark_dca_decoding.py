@@ -13,13 +13,10 @@ from einops import rearrange, repeat
 from flash_attn.utils.benchmark import benchmark_all, benchmark_forward, benchmark_backward
 from flash_attn.utils.benchmark import benchmark_fwd_bwd, benchmark_combined
 
-from flash_attn import flash_attn_qkvpacked_func
+from flash_attn import flash_attn_with_kvcache, flash_dca_with_kvcache
 
 from typing import Any, Dict, List, Optional, Type
 
-import torch
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from vllm import _custom_ops as ops
 
 NUM_BLOCKS = 1024
 PARTITION_SIZE = 512
@@ -28,11 +25,6 @@ try:
     from triton.ops.flash_attention import attention as attention_triton
 except ImportError:
     attention_triton = None
-
-try:
-    import xformers.ops as xops
-except ImportError:
-    xops = None
 
 @nvtx.annotate('dca_decode', color='red')
 def _bruteforce_dynamic_chunk_pageattention_forward_decode(
@@ -193,7 +185,7 @@ def _pagedattention_forward_decode_with_exp_sums(
         softmax_scale=softmax_scale,
         alibi_slopes=alibi_slopes,
         causal=causal,
-        # return_softmax=False,
+        return_softmax_lse=True,
     )
     cache_seqlens_cpu = cache_seqlens.cpu()
     for i in range(cache_seqlens.shape[0]):
@@ -320,8 +312,10 @@ seqlen_qk = [
     # (3, 799),
     # (64, 2048),
     # (16, 20000),
+    (1, 32 * 1024),
+    (1, 64 * 1024),
     (1, 128 * 1024),
-    (16, 128 * 1024),
+    (1, 512 * 1024),
     (1, 1024 * 1024)
     # (128, 128),
 ]
@@ -334,10 +328,12 @@ dropout_p = 0.0
 num_kv_heads = 8
 
 methods = [
-    'flash_attn_with_kv_cache',
+    'flash_attn_with_kvcache',
+    'flash_dca_with_kvcache',
     # 'paged_attention_v2',
     'dca_decode',
 ]
+chunk_infos = [(8 * 1024, 0), (32 * 1024, 0)]
 
 time_f = {}
 time_b = {}
@@ -345,10 +341,12 @@ time_f_b = {}
 speed_f = {}
 speed_b = {}
 speed_f_b = {}
-for causal, headdim, (seqlen_q, seqlen_k), new_kv, paged_kv_block_size in product(
-    causal_vals, headdim_vals, seqlen_qk, new_kvs, paged_kv_block_sizes
+for (chunk_size, local_size), causal, headdim, (seqlen_q, seqlen_k), new_kv, paged_kv_block_size in product(
+    chunk_infos, causal_vals, headdim_vals, seqlen_qk, new_kvs, paged_kv_block_sizes
 ):
     if seqlen_q > seqlen_k and new_kv:
+        continue
+    if (chunk_size - local_size) * 3 > max(seqlen_q, seqlen_k):
         continue
 
     batch_size = 1
@@ -356,7 +354,7 @@ for causal, headdim, (seqlen_q, seqlen_k), new_kv, paged_kv_block_size in produc
               seqlen_k, new_kv, paged_kv_block_size)
     nheads = dim // headdim
     batch_size_cache = 1
-    nheads_k = 1
+    nheads_k = 8
     local = False
     seqlen_new_eq_seqlen_q = seqlen_q
     seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(
@@ -404,8 +402,13 @@ for causal, headdim, (seqlen_q, seqlen_k), new_kv, paged_kv_block_size in produc
         dtype=torch.int32,
         device=device,
     )
+    cache_seqlens = torch.tensor(
+        [k_cache.shape[1]],
+        dtype=torch.int32,
+        device=q.device,
+    )
 
-    if 'flash_attn_with_kv_cache' in methods:
+    if 'flash_attn_with_kvcache' in methods:
 
         # print('flash_attn_with_kvcache', q.shape, k_cache.shape, v_cache.shape)
         with nvtx.annotate("flash_decoding", color="green"):
@@ -423,30 +426,57 @@ for causal, headdim, (seqlen_q, seqlen_k), new_kv, paged_kv_block_size in produc
                 repeats=repeats, 
                 verbose=False
             )
-            time_f[config, 'flash_attn_with_kv_cache'] = f
+            time_f[config, 'flash_attn_with_kvcache'] = f
 
-    if 'paged_attention_v2' in methods:
-
-        # Prepare for the paged attention kernel.
-        output = torch.empty_like(q)
-        ops.paged_attention_v2(
-            output,
-            exp_sums,
-            max_logits,
-            tmp_output,
+    if 'flash_dca_with_kvcache' in methods:
+        f = time_fwd(
+            flash_dca_with_kvcache,
             q,
-            k_cache,
-            v_cache,
-            num_kv_heads,
-            None,
-            block_table,
-            cache_seqlens,
-            block_size,
-            max_seq_len,
-            None,
-            dtype,
-            None,
+            q_succ,
+            q_inter,
+            k_cache if paged_kv_block_size is None else k_cache_paged,
+            v_cache if paged_kv_block_size is None else v_cache_paged,
+            chunk_size,
+            local_size,
+            k,
+            v,
+            rotary_cos=None,
+            rotary_sin=None,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=None,
+            cache_leftpad=None,
+            block_table=block_table,
+            causal=causal,
+            window_size=(-1, -1),
+            rotary_interleaved=False,
+            alibi_slopes=None,
+            num_splits=0,
         )
+        time_f[config, 'flash_dca_with_kvcache'] = f
+
+
+    # if 'paged_attention_v2' in methods:
+
+    #     # Prepare for the paged attention kernel.
+    #     output = torch.empty_like(q)
+    #     ops.paged_attention_v2(
+    #         output,
+    #         exp_sums,
+    #         max_logits,
+    #         tmp_output,
+    #         q,
+    #         k_cache,
+    #         v_cache,
+    #         num_kv_heads,
+    #         None,
+    #         block_table,
+    #         cache_seqlens,
+    #         block_size,
+    #         max_seq_len,
+    #         None,
+    #         dtype,
+    #         None,
+    #     )
 
     if 'dca_decode' in methods:
         # print(q.shape, k_cache.shape, v_cache.shape)            
@@ -462,13 +492,13 @@ for causal, headdim, (seqlen_q, seqlen_k), new_kv, paged_kv_block_size in produc
             softmax_scale=None,
             causal=True,
             alibi_slopes=None,
-            chunk_size=32768,
-            local_size=2048,
+            chunk_size=chunk_size,
+            local_size=local_size,
             original_max_position_embeddings=32768,
         )
         time_f[config, 'dca_decode'] = f
 
-    print(f"### causal={causal}, headdim={headdim}, batch_size={batch_size}, seqlen_q={seqlen_q}, seqlen_k={seqlen_k}, new_kv={new_kv}, paged_kv_block_size={paged_kv_block_size} ###")
+    print(f"### chunk_len={chunk_size-local_size} causal={causal}, headdim={headdim}, batch_size={batch_size}, seqlen_q={seqlen_q}, seqlen_k={seqlen_k}, new_kv={new_kv}, paged_kv_block_size={paged_kv_block_size} ###")
     for method in methods:
         time_f[config, method] = time_f[config, method]
         # speed_f[config, method] = efficiency(

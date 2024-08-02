@@ -387,9 +387,9 @@ std::tuple<at::Tensor, at::Tensor> set_params_dca_splitkv(Flash_dca_fwd_params &
     TORCH_CHECK(chunk_len % block_n == 0, "chunk_len(chunk_size-local_size) must be divided by block_n:" + std::to_string(block_n));
 
     // we only apply splitkv for inter chunk, and use extra blocks for succ & intra chunk which is ralatively small
-    const int intra_succ_length = chunk_len + chunk_len;
-    TORCH_CHECK(max_seqlen_k > intra_succ_length, "too small kv seqlen for DCA, need at least 2 * chunk_len (chunk_size - local_size)");
-    const int inter_num_n_blocks = (max_seqlen_k + block_n - 1 - intra_succ_length) / block_n;
+    TORCH_CHECK(max_seqlen_k > chunk_len + chunk_len, "too small kv seqlen for DCA, need at least 2 * chunk_len (chunk_size - local_size)");
+    const int inter_num_n_blocks = (((max_seqlen_k - 1) / chunk_len) * chunk_len + block_n - 1 - chunk_len) / block_n;
+    // std::cout << "max_seqlen_k: " << max_seqlen_k << " intra_succ_length " << intra_succ_length << std::endl;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
     const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
@@ -402,6 +402,8 @@ std::tuple<at::Tensor, at::Tensor> set_params_dca_splitkv(Flash_dca_fwd_params &
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
             params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount * 2, inter_num_n_blocks, 128) 
                                 + 2 /* for succ chunk and intra chunk */;
+            // std::cout << "setting num_split " + std::to_string(params.num_splits)
+            //           << " inter_n_blocks " + std::to_string(inter_num_n_blocks) << std::endl;
         }
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
