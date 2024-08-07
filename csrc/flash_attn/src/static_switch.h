@@ -112,3 +112,11 @@
       return __VA_ARGS__();                \
     }                                      \
   }()
+  
+#define DCA_HEADDIM_SWITCH(HEADDIM, ...)   \
+  [&] {                                    \
+    if (HEADDIM <= 128) {           \
+      constexpr static int kHeadDim = 128; \
+      return __VA_ARGS__();                \
+    }                                      \
+  }()

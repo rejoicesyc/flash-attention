@@ -137,12 +137,23 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_rotary_interleaved;
 
     int num_splits;  // For split-KV version
+    // Especially, we have num_splits = num_split_kv_inter + 1(intra) + 1(succ) for flash DCA,
 
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+};
+
+struct Flash_dca_fwd_params: public Flash_fwd_params {
+
+    // append q_succ, q_inter for DCA
+    void *__restrict__ q_succ_ptr; 
+    void *__restrict__ q_inter_ptr; 
+
+    int chunk_len;
+    int num_n_chunk_blocks;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -193,3 +204,6 @@ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_pa
 template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+
+template<typename T, int Headdim, bool Is_causal> void run_dca_fwd_(Flash_dca_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_dca_fwd_splitkv_dispatch(Flash_dca_fwd_params &params, cudaStream_t stream);

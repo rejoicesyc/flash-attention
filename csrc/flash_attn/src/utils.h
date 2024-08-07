@@ -296,7 +296,8 @@ template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bo
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
 __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
                             Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0, 
+                            const int min_MN=0) {
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
@@ -306,7 +307,9 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
+        const int actual_mn = get<0>(identity_MN(0, m, 0));
         if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+        // if (Is_even_MN || actual_mn < max_MN && actual_mn > min_MN) {
             #pragma unroll
             for (int k = 0; k < size<2>(S); ++k) {
                 if (Is_even_K || predicate_K(k)) {

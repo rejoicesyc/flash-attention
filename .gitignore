@@ -25,3 +25,8 @@ var/
 
 # Dev
 venv
+
+# tmp
+.cache/
+.eggs/
+compile_commands.json
