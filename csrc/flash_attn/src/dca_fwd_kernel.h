@@ -59,7 +59,7 @@ __forceinline__ __device__ void dca_softmax(Tensor0 &acc_o, Tensor1 &sQ_intra, T
     // constexpr int kHeadDim = Kernel_traits::kHeadDim;
 
     TensorT lse_max, lse_rcp;
-    clear(acc_o);
+    // clear(acc_o);
     // Tensor rO = flash::convert_type<Element>(acc_o);
     // clear(rO);
     // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
@@ -88,14 +88,14 @@ __forceinline__ __device__ void dca_softmax(Tensor0 &acc_o, Tensor1 &sQ_intra, T
     }
     #pragma unroll
     for (int mi = 0; mi < size(lse_max); ++mi) { 
-        if (bidb == 0 && bidh == 0) {
-            printf("m_block [%d], mi [%d/%d], tidx [%d/%d] lse_intra [%f], lse_succ [%f], lse_inter [%f]\n",
-                   m_block, mi, static_cast<int>(size<0>(acc_o_rowcol)), tidx, blockDim.x,
-                   lse_intra(mi), lse_succ(mi), lse_inter(mi));
-        }
-        lse_inter(mi) = exp2f(lse_inter(mi) - lse_max(mi));
-        lse_succ(mi) = exp2f(lse_succ(mi) - lse_max(mi));
-        lse_intra(mi) = exp2f(lse_intra(mi) - lse_max(mi));
+        // if (bidb == 0 && bidh == 0 && tidx == 0) {
+        //     printf("m_block [%d], mi [%d/%d], tidx [%d/%d] lse_intra [%f], lse_succ [%f], lse_inter [%f]\n",
+        //            m_block, mi, static_cast<int>(size<0>(acc_o_rowcol)), tidx, blockDim.x,
+        //            lse_intra(mi), lse_succ(mi), lse_inter(mi));
+        // }
+        lse_inter(mi) = expf(lse_inter(mi) - lse_max(mi));
+        lse_succ(mi) = expf(lse_succ(mi) - lse_max(mi));
+        lse_intra(mi) = expf(lse_intra(mi) - lse_max(mi));
         const float l_sum = lse_intra(mi) + lse_succ(mi) + lse_inter(mi);
         lse_rcp(mi) = (l_sum == 0.f || l_sum != l_sum) ? 1.f : 1.f / l_sum;
     }
@@ -103,13 +103,20 @@ __forceinline__ __device__ void dca_softmax(Tensor0 &acc_o, Tensor1 &sQ_intra, T
     Tensor1 vec_sQ[3] = {sQ_intra, sQ_succ, sQ_inter};
     Tensor2 vec_lse[3] = {lse_intra, lse_succ, lse_inter};
     const char* chunk_name[3] = {"intra", "succ", "inter"};
+    __syncthreads();
+    clear(acc_o_rowcol);
     #pragma unroll
     for (int i = 0; i < 3; ++i) {
         auto &sQ = vec_sQ[i];
         auto &lse = vec_lse[i];
 
-        Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
+        // if (cute::thread0()) {
+        //     printf("%s: sQ[0] = %f\n", chunk_name[i], static_cast<float>(sQ(0, 0)));
+        // }
+
+        Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});
         Tensor rO = make_tensor<Element>(shape(acc_o));
+        clear(rO);
         auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
         auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
 
@@ -118,16 +125,23 @@ __forceinline__ __device__ void dca_softmax(Tensor0 &acc_o, Tensor1 &sQ_intra, T
         Tensor taccOrO = smem_thr_copy_O.retile_D(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
 
         // // sO has the same size as sQ, so we don't need to sync here.
-        // if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
-        __syncthreads();
+        if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
+        // __syncthreads();
+        // if (i == 0) { clear(acc_o_rowcol); }
 
         cute::copy(smem_tiled_copy_O, taccOsO, taccOrO);
         Tensor rO_rowcol = make_tensor(rO.data(), flash::convert_layout_acc_rowcol(rO.layout()));
-        if (cute::thread0()) {
-            print(sO);
-            printf("-----------------------------\n");
-            print_tensor(rO);
-        }
+
+        // if (cute::thread0()) {
+        //     // print_tensor(sO);
+        //     printf("rO(0, 0, 0) = %f, rO(1, 0, 0) = %f, rO(2, 0, 0) = %f, rO(3, 0, 0) = %f\n", 
+        //             static_cast<float>(rO(0, 0, 0)),
+        //             static_cast<float>(rO(1, 0, 0)),
+        //             static_cast<float>(rO(2, 0, 0)),
+        //             static_cast<float>(rO(3, 0, 0)));
+        //     print(rO.layout());
+        //     print(rO_rowcol.layout());
+        // }
 
         #pragma unroll
         for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) { 
@@ -135,16 +149,19 @@ __forceinline__ __device__ void dca_softmax(Tensor0 &acc_o, Tensor1 &sQ_intra, T
             for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
                 rO_rowcol(mi, ni) *= static_cast<Element>(lse(mi) * lse_rcp(mi));
                 acc_o_rowcol(mi, ni) += rO_rowcol(mi, ni);
-                if (bidb == 0 && bidh == 0 && tidx == 0 && ni < 4) {
-                    printf("m_block [%d], %s, mi [%d/%d], ni [%d/%d] acc [%f] += row [%f] * lse [%f] * lse_rcp [%f]\n",
-                            m_block, chunk_name[i], //(i == 0) ? "intra" : ((i == 1) ? "succ" : "inter"),
-                            mi, static_cast<int>(size<0>(acc_o_rowcol)),
-                            ni, static_cast<int>(size<1>(acc_o_rowcol)),
-                            acc_o_rowcol(mi, ni), static_cast<float>(rO_rowcol(mi, ni)), lse(mi), lse_rcp(mi));
-                }
+                // if (bidb == 0 && bidh == 0 && tidx == 0 && ni < 4) {
+                //     printf("m_block [%d], %s, mi [%d/%d], ni [%d/%d] acc [%f] += row [%f] * lse [%f] * lse_rcp [%f]\n",
+                //             m_block, chunk_name[i], //(i == 0) ? "intra" : ((i == 1) ? "succ" : "inter"),
+                //             mi, static_cast<int>(size<0>(acc_o_rowcol)),
+                //             ni, static_cast<int>(size<1>(acc_o_rowcol)),
+                //             acc_o_rowcol(mi, ni), r0_rowcol_val, lse(mi), lse_rcp(mi));
+                // }
             }
         }
     }
+    // if (cute::thread0()) {
+    //     // printf("acc_o(0, 0) = %f\n", acc_o(0, 0));
+    // }
     auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
     Tensor sO = make_tensor(sQ_intra.data(), typename Kernel_traits::SmemLayoutO{});
@@ -326,10 +343,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         const int n_block_min,
         const int n_block_max,
         auto &lse
-        // const int actual_seqlen_q_min,
-        // const int actual_seqlen_q_max,
-        // const int actual_seqlen_kv_min,
-        // const int actual_seqlen_kv_max
     ) {
         //
         // Copy Atom retiling
@@ -577,18 +590,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
-        if (cute::thread0()) {
-            printf("lse(0) = %f\n", lse(0));
-            print_tensor(acc_o);
-        }
+        // if (cute::thread0()) {
+        //     printf("lse(0) = %f\n", lse(0));
+        //     print_tensor(acc_o);
+        // }
     }; // compute_attn_1rowchunk
 
     auto copy_acc2smem = [&](auto &sQ) {
-        if (cute::thread0()) {
-            printf(" check entry copy\n");
-            print_tensor(acc_o);
-        }
-        __syncthreads();
+        // if (cute::thread0()) {
+        //     printf(" check entry copy\n");
+        //     print_tensor(acc_o);
+        // }
+        // __syncthreads();
 
         // Convert acc_o from fp32 to fp16/bf16
         Tensor rO = flash::convert_type<Element>(acc_o);
@@ -604,12 +617,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
-        __syncthreads();
-        if (cute::thread0()) {
-            printf(" check acc %f\n", static_cast<float>(sQ(0, 0)));
-            print_tensor(rO);
-            print_tensor(sO);
-        }
+        // __syncthreads();
+        // if (cute::thread0()) {
+        //     printf(" check acc %f\n", static_cast<float>(sQ(0, 0)));
+        //     print_tensor(rO);
+        //     // print_tensor(sO);
+        // }
     };
 
     const int chunk_len = params.chunk_len;
@@ -632,46 +645,41 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     using TensorLSE = decltype(make_tensor<float>(Shape<Int<2 * size<1>(acc_o)>>{}));
     // auto lse_shape = Shape<Int<2 * 2 * size<1>(acc_o)>>{};
     TensorLSE lse_intra, lse_succ, lse_inter;
-    // clear(acc_o);
+    cute::fill(lse_intra, -INFINITY);
+    clear(acc_o);
     if (n_block_max_intra > n_block_min_intra) {
         // const int actual_seqlen_k_min = 
         compute_attn_1rowchunk(tQgQ_intra, tQsQ_intra, tSrQ_intra, sQ_intra, n_block_min_intra, n_block_max_intra, lse_intra);
-        if (cute::thread0()) {
-            printf("check acc_o inside intra condition\n");
-            print_tensor(acc_o);
-        }
-    } else {
-        printf("m_block:%d bidb:%d bidh:%d tidx:%d intra else\n", m_block, bidb, bidh, tidx);
+        // if (cute::thread0()) {
+        //     printf("check acc_o inside intra condition\n");
+        //     print_tensor(acc_o);
+        // }
     }
     copy_acc2smem(sQ_intra);
 
+    cute::fill(lse_succ, -INFINITY);
     clear(acc_o);
     if (n_block_max_succ > n_block_min_succ) {
         compute_attn_1rowchunk(tQgQ_succ, tQsQ_succ, tSrQ_succ, sQ_succ, n_block_min_succ, n_block_max_succ, lse_succ);
     } 
-    // else {
-        // printf("m_block:%d bidb:%d bidh:%d tidx:%d succ else\n", m_block, bidb, bidh, tidx);
-    // }
     copy_acc2smem(sQ_succ);
 
+    cute::fill(lse_inter, -INFINITY);
     clear(acc_o);
     if (n_block_max_inter > n_block_min_inter) {
         compute_attn_1rowchunk(tQgQ_inter, tQsQ_inter, tSrQ_inter, sQ_inter, n_block_min_inter, n_block_max_inter, lse_inter);
     } 
-    // else {
-        // printf("m_block:%d bidb:%d bidh:%d tidx:%d inter else\n", m_block, bidb, bidh, tidx);
-    // }
     copy_acc2smem(sQ_inter);
 
-    __syncthreads();
-    if (cute::thread0()) {
-        printf("intra %f, succ %f, inter %f\n", 
-        static_cast<float>(sQ_intra(0, 0)), static_cast<float>(sQ_succ(0, 0)), static_cast<float>(sQ_inter(0, 0)));
-    }
+    // __syncthreads();
+    // if (cute::thread0()) {
+    //     printf("intra %f, succ %f, inter %f\n", 
+    //     static_cast<float>(sQ_intra(0, 0)), static_cast<float>(sQ_succ(0, 0)), static_cast<float>(sQ_inter(0, 0)));
+    // }
 
-    if (cute::thread0()) {
-        printf("lse_intra[0] = %f, lse_succ[0] = %f, lse_inter[0] = %f\n", lse_intra(0), lse_succ(0), lse_inter(0));
-    }
+    // if (cute::thread0()) {
+    //     printf("lse_intra[0] = %f, lse_succ[0] = %f, lse_inter[0] = %f\n", lse_intra(0), lse_succ(0), lse_inter(0));
+    // }
 
     // auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
     // auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
