@@ -85,12 +85,6 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
     def merge_attn_outputs(flash_results):
         attn_outputs_all = []
         for flash_per_chunk in flash_results:
-            for x in flash_per_chunk:
-                print(x[0].shape, x[1].shape, x[0][:16, :, :4], x[1], end=', ')
-            print()
-        for flash_per_chunk in flash_results:
-            # for x in flash_per_chunk:
-            #     print(x[0].shape, x[1].shape)
             if len(flash_per_chunk) == 1:
                 attn_outputs_all.append(flash_per_chunk[0][0])
                 continue
@@ -102,19 +96,12 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
                 flash_attn_output[1]
                 for flash_attn_output in flash_per_chunk
             ]).to(torch.float32)
-            print(logits.shape)
-            print(logits)
             max_logits = torch.max(logits, dim=0).values
             stable_logits = logits - max_logits.unsqueeze(0)
             lse_s = torch.exp(stable_logits).detach()
             lse_sum = torch.sum(lse_s, dim=0)
             lse_s /= lse_sum
-            # print('attn_outputs', attn_outputs.shape, 'lse_s', 
-            #       lse_s.shape, lse_s.unsqueeze(-1).transpose(2, 3).squeeze(1).shape, lse_s.unsqueeze(-1).transpose(1, 2).squeeze(1).shape,
-            #       lse_s.unsqueeze(-1).transpose(1, 2).shape)
-            # import pdb; pdb.set_trace()
-            attn_outputs *= lse_s.unsqueeze(-1).transpose(2, 3).squeeze(1)
-            print(attn_outputs.dtype)
+            attn_outputs *= lse_s.unsqueeze(-1).transpose(1, 2).squeeze(1)
             attn_outputs_all.append(attn_outputs.sum(dim=0))
         return torch.cat(attn_outputs_all, dim=0)
 
@@ -161,8 +148,6 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
                 max_seqlen_k=end - prev_chunk_end_pos,
             )
         else:
-            # print(f'intra {prev_chunk_end_pos}:{end}')
-            print(f'intra flash q[{qbegin}:{qend}] kv[{prev_chunk_end_pos}:{end}]')
             k_states_intra = k[prev_chunk_end_pos:end]
             v_states_intra = v[prev_chunk_end_pos:end]
             flash_result = do_flash_attn(q_states_intra, k_states_intra,
@@ -183,7 +168,6 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
                     max_seqlen_k=chunk_len,
                 )
             else:
-                print(f'succ flash q[{qbegin}:{qend}] kv[{prev_chunk_end_pos-chunk_len}:{prev_chunk_end_pos}]')
                 k_states_succ = k[prev_chunk_end_pos -
                                     chunk_len:prev_chunk_end_pos]
                 v_states_succ = v[prev_chunk_end_pos -
@@ -206,7 +190,6 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
                     max_seqlen_k=prev_chunk_end_pos - chunk_len,
                 )
             else:
-                print(f'inter q[{qbegin}:{qend}], kv[0:{prev_chunk_end_pos - chunk_len}]')
                 k_states_inter = k[:prev_chunk_end_pos - chunk_len]
                 v_states_inter = v[:prev_chunk_end_pos - chunk_len]
                 flash_result = do_flash_attn(q_states_inter,
@@ -257,7 +240,6 @@ def _bruteforce_dynamic_chunk_flash_attn_varlen_func(
 
     all_outputs = []
     for i in range(0, len(cu_seqlens_q_cpu) - 1):
-        print(f'batch {i}/{len(cu_seqlens_q_cpu)}')
         qs = cu_seqlens_q_cpu[i]
         qe = cu_seqlens_q_cpu[i:i + 2][-1]
         ks = cu_seqlens_k_cpu[i]
@@ -290,7 +272,6 @@ def _bruteforce_dynamic_chunk_flash_attn_varlen_func(
                 ))
             continue
 
-        # import pdb; pdb.set_trace()
         current_output = _bruteforce_dynamic_chunk_flash_attn_func(
             current_q,
             current_q_succ,
@@ -326,7 +307,6 @@ def _bruteforce_dynamic_chunk_pageattention_forward_decode(
 ):
     assert causal
     batch_size = block_table.shape[0]
-    # print(value_cache.shape)
     block_size = value_cache.shape[1]
     chunk_len = chunk_size - local_size
     if chunk_len % block_size != 0:
@@ -364,7 +344,6 @@ def _bruteforce_dynamic_chunk_pageattention_forward_decode(
             st + (max_seq_len_intra - 1) // block_size + 1,
             (cache_seqlens[i] - 1) // block_size + 1,
         )
-        print(f'intra {st*block_size} : {ed* block_size}, seq_lens_intra : {seq_lens_intra}')
         block_table_intra[i, :ed - st] = block_table[i, st:ed]
     intra_output, intra_softmax_lse = (
         _pagedattention_forward_decode_with_exp_sums(
@@ -398,7 +377,6 @@ def _bruteforce_dynamic_chunk_pageattention_forward_decode(
                 st + (max_seq_len_succ - 1) // block_size + 1,
                 (cache_seqlens[i] - 1) // block_size + 1,
             )
-            print(f'succ {st*block_size} : {ed* block_size}, seq_lens_succ : {seq_lens_succ}')
             block_table_succ[i, :ed - st] = block_table[i, st:ed]
         succ_output, succ_softmax_lse = (
             _pagedattention_forward_decode_with_exp_sums(
@@ -418,7 +396,6 @@ def _bruteforce_dynamic_chunk_pageattention_forward_decode(
     seq_lens_inter = (chunk_num_curr - 1).clip(min=0) * chunk_len
     max_seq_len_inter = seq_lens_inter.max().item()
     if max_seq_len_inter:
-        print(f'inter 0 : {max_seq_len_inter}, seq_lens_inter : {seq_lens_inter}')
         inter_output, succ_softmax_lse = (
             _pagedattention_forward_decode_with_exp_sums(
                 query_inter,
@@ -430,25 +407,19 @@ def _bruteforce_dynamic_chunk_pageattention_forward_decode(
                 alibi_slopes,
                 causal=False,
             ))
-        print('lse dtype', succ_softmax_lse.dtype)
         outputs_list.append(inter_output)
         softmax_lses_list.append(succ_softmax_lse)
 
     outputs = torch.stack(outputs_list, dim=0)
-    # print(outputs.shape)
-    # print(outputs[:, :, :, :, :4])
     del outputs_list
     softmax_lses = torch.stack(softmax_lses_list, dim=0).to(torch.float32)
     del softmax_lses_list
 
-    # print('softmax_lses', softmax_lses)
     max_logits = torch.max(softmax_lses, dim=0).values
-    # print('max_logits', max_logits)
     stable_logits = softmax_lses - max_logits.unsqueeze(0)
     lse_s = torch.exp(stable_logits).detach()
     lse_sum = torch.sum(lse_s, dim=0)
     lse_s /= lse_sum
-    # print('lse_s', lse_s)
     outputs *= lse_s.unsqueeze(-1).transpose(2, 3)
 
     return outputs.sum(0)
@@ -465,8 +436,6 @@ def _pagedattention_forward_decode_with_exp_sums(
     causal: bool,
 ):
 
-    # out, softmax_lse = flash_attn_with_kvcache(
-    # print('flash_attn_with_kvcache', query.shape, key_cache.shape, value_cache.shape)
     out, softmax_lse = flash_attn_with_kvcache(
         query,
         key_cache,
@@ -487,8 +456,8 @@ def _pagedattention_forward_decode_with_exp_sums(
     return out, softmax_lse
 
 
-# @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 @pytest.mark.parametrize("d", [128])
@@ -496,22 +465,26 @@ def _pagedattention_forward_decode_with_exp_sums(
     "batch_size,seqlen_qk",
     [
         # (14, 1024, 1024),
-        # (1, 32 * 1024, 32 * 1024),
-        (1, 128)
-        # (1, 128 * 1024 + 377, 128 * 1024 + 377),
+        (33, 8 * 1024),
+        (7, 16 * 1024),
+        (1, 32 * 1024),
+        # (1, 64 * 1024),
+        # (1, 128 * 1024),
     ],
 )
 @pytest.mark.parametrize(
     "nheads_q, nheads_k", [
-        # (8, 1), # test gqa
-        (1, 1),
+        (8, 1), # test gqa
+        (8, 2), # test mqa
+        (8, 8),
     ]
 )
 @pytest.mark.parametrize(
     "chunk_size, local_size", [
-        (128, 0),
+        # (128, 0),
         # (8192, 1024),
         # (32 * 1024, 2048),
+        (x * 1024, 0) for x in range(2, 16, 2)
     ]
 )
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
@@ -551,8 +524,8 @@ def test_dca_varlen_causal(
         k, v, block_table, k_cache_paged, v_cache_paged, num_blocks = _generate_block_kvcache(
             seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
         )
-    query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="full")
-    # query_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
+    # query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="full")
+    query_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
     (
         q_unpad,
         k_unpad,
@@ -570,20 +543,6 @@ def test_dca_varlen_causal(
     ) = generate_qkv(q, k, v, query_padding_mask, query_padding_mask, kvpacked=False)
     q_succ_unpad = torch.randn_like(q_unpad)
     q_inter_unpad = torch.randn_like(q_unpad)
-    # import pdb; pdb.set_trace()
-    print('cu_seqlens_q', cu_seqlens_q)
-    print('cu_seqlens_k', cu_seqlens_k)
-    print(q_unpad.shape, k_unpad.shape, v_unpad.shape)
-    # cu_seqlens_q = torch.tensor(
-    #     [seqlen_q] * batch_size,
-    #     dtype=torch.int32,
-    #     device=q.device,
-    # )
-    # cu_seqlens_k = torch.tensor(
-    #     [seqlen_k] * batch_size,
-    #     dtype=torch.int32,
-    #     device=q.device,
-    # )
     out_unpad = flash_dca_varlen_func(
         q_unpad,
         q_succ_unpad,
@@ -601,88 +560,29 @@ def test_dca_varlen_causal(
         window_size=window_size,
         block_table=block_table,
     )
-    torch.cuda.synchronize()
-    # q, q_succ, q_inter, k, v = [
-    #     rearrange(t, "b s h d -> (b s) h d") for t in [
-    #         q_unpad, q_succ_unpad, q_inter_unpad, k_unpad, v_unpad
-    #     ]
-    # ]
-    # import pdb; pdb.set_trace()
-    print(q_unpad.shape, q_succ_unpad.shape, q_inter_unpad.shape, k_unpad.shape, v_unpad.shape)
-    ref_out = _bruteforce_dynamic_chunk_flash_attn_func(
+    ref_out = _bruteforce_dynamic_chunk_flash_attn_varlen_func(
         q_unpad,
         q_succ_unpad,
         q_inter_unpad,
-        k_unpad,
-        v_unpad,
-        block_table=None,
+        k_unpad if paged_kv_block_size is None else k_cache_paged,
+        v_unpad if paged_kv_block_size is None else v_cache_paged,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
         softmax_scale=None,
+        causal=causal,
+        window_size=window_size,
+        alibi_slopes=None,
         chunk_size=chunk_size,
         local_size=local_size,
-        original_max_position_embeddings=0,
-        current_prefill_original_seq_lens_tensor=None,
-        k_length=k_unpad.shape[0],
+        block_table=None,
+        original_max_position_embeddings=0, #32768,
+        prefill_original_seq_lens_tensor=[None] * batch_size,
     )
-    print(out_unpad[:16, :, :4])
-    print(ref_out[:16, :, :4])
-    # ref_out = _bruteforce_dynamic_chunk_flash_attn_varlen_func(
-    #     q_unpad,
-    #     q_succ_unpad,
-    #     q_inter_unpad,
-    #     k_unpad if paged_kv_block_size is None else k_cache_paged,
-    #     v_unpad if paged_kv_block_size is None else v_cache_paged,
-    #     cu_seqlens_q,
-    #     cu_seqlens_k,
-    #     max_seqlen_q,
-    #     max_seqlen_k,
-    #     softmax_scale=None,
-    #     causal=causal,
-    #     window_size=window_size,
-    #     alibi_slopes=None,
-    #     chunk_size=chunk_size,
-    #     local_size=local_size,
-    #     block_table=None,
-    #     original_max_position_embeddings=0, #32768,
-    #     prefill_original_seq_lens_tensor=[None] * batch_size,
-    # )
+    print(f"Output max diff: {(out_unpad - ref_out).abs().max().item()}")
+    print(f"Output mean diff: {(out_unpad - ref_out).abs().mean().item()}")
     torch.testing.assert_close(out_unpad, ref_out, atol=1e-2, rtol=0)
-
-    # out = output_pad_fn(out_unpad)
-    # out_ref, attn_ref = attention_ref(
-    #     q,
-    #     k,
-    #     v,
-    #     query_padding_mask,
-    #     key_padding_mask,
-    #     None,
-    #     0.0,
-    #     None,
-    #     causal=causal,
-    #     window_size=window_size,
-    # )
-    # out_pt, attn_pt = attention_ref(
-    #     q,
-    #     k,
-    #     v,
-    #     query_padding_mask,
-    #     key_padding_mask,
-    #     None,
-    #     0.0,
-    #     None,
-    #     causal=causal,
-    #     window_size=window_size,
-    #     upcast=False,
-    #     reorder_ops=True,
-    # )
-
-    # print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-    # print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-    # print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-    # print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-
-    # # Check that FlashAttention's numerical error is at most twice the numerical error
-    # # of a Pytorch implementation.
-    # assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
 
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -735,13 +635,12 @@ def test_dca_varlen_causal(
         # (4096, 0),
         # (8 * 1024, 0),
         # (32 * 1024, 0),
-        # # (8192, 1024),
+        # (8192, 1024),
         # (32 * 1024, 2048),
         (x * 1024, 0) for x in range(2, 33, 2)
     ]
 )
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-def xtest_dca_kvcache(
+def test_dca_kvcache(
     batch_size,
     seqlen_q,
     seqlen_k,
@@ -774,7 +673,6 @@ def xtest_dca_kvcache(
         print(f'skip for {chunk_size} {local_size} {seqlen_k}')
         pytest.skip()
     device = "cuda"
-    print(seqlen_q, seqlen_k)
     # set seed
     torch.random.manual_seed(0)
     # batch_size = 4
@@ -898,20 +796,9 @@ def xtest_dca_kvcache(
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     q_succ = torch.randn_like(q)
     q_inter = torch.randn_like(q)
-    print(q.shape)
-    print(k_cache.shape)
-    print(cache_batch_idx)
-    print(cache_leftpad)
-    # cache_seqlens = torch.tensor(
-    #     [k_cache.shape[1]] * batch_size,
-    #     dtype=torch.int32,
-    #     device=q.device,
-    # )
     if (chunk_size - local_size) * 2 >= min(cache_seqlens):
         print(f'skip {chunk_size} : {local_size} {cache_seqlens}')
         pytest.skip()
-    print(cache_seqlens)
-    # import pdb; pdb.set_trace()
     out = flash_dca_with_kvcache(
         q,
         q_succ,
@@ -934,7 +821,6 @@ def xtest_dca_kvcache(
         alibi_slopes=alibi_slopes,
         num_splits=num_splits,
     )
-    torch.cuda.synchronize()
     out_ref = _bruteforce_dynamic_chunk_pageattention_forward_decode(
         q,
         q_succ,
@@ -950,82 +836,6 @@ def xtest_dca_kvcache(
         local_size=local_size,
         original_max_position_embeddings=32768,
     )
-    # print(out[:, :, :, :8])
-    print(out.shape, out_ref.shape)
-    # print(out[:, :, :, :8])
-    # print(out_ref[:, :, :, :8])
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
-
-
-    # out = flash_attn_with_kvcache(
-    #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size
-    # )
-    # out = flash_attn_with_kvcache(q, k_cache, v_cache, causal=causal, window_size=window_size)
-    # qk = torch.einsum("bqhd,bkhd->bhqk", q, k_cache_ref)
-    # m = qk.amax(-1, keepdim=True)
-    # s_tmp = torch.exp((qk - m) / math.sqrt(d))
-    # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
-    # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
-    # probs = torch.softmax(qk, dim=-1)
-
-    # ///////// return ///////////
-    # out_ref, _ = attention_ref(
-    #     q_ro,
-    #     k_cache_rep,
-    #     v_cache_rep,
-    #     None,
-    #     key_padding_mask,
-    #     attn_bias,
-    #     0.0,
-    #     None,
-    #     causal=causal,
-    #     window_size=window_size,
-    #     key_leftpad=cache_leftpad,
-    # )
-    # out_pt, _ = attention_ref(
-    #     q_ro,
-    #     k_cache_rep,
-    #     v_cache_rep,
-    #     None,
-    #     key_padding_mask,
-    #     attn_bias,
-    #     0.0,
-    #     None,
-    #     causal=causal,
-    #     window_size=window_size,
-    #     upcast=False,
-    #     reorder_ops=True,
-    #     key_leftpad=cache_leftpad,
-    # )
-    # print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-    # print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
-    # print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-    # print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-
-    # # Check that FlashAttention's numerical error is at most twice the numerical error
-    # # of a Pytorch implementation.
-    # if new_kv:
-    #     if paged_kv_block_size is None:
-    #         k_cache_select = (
-    #             k_cache if not has_batch_idx else k_cache[cache_batch_idx.to(dtype=torch.long)]
-    #         )
-    #         v_cache_select = (
-    #             v_cache if not has_batch_idx else v_cache[cache_batch_idx.to(dtype=torch.long)]
-    #         )
-    #     else:
-    #         k_cache_select = rearrange(
-    #             k_cache_paged[block_table.to(dtype=torch.long).flatten()],
-    #             "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-    #             b=batch_size,
-    #         )[:, :seqlen_k]
-    #         v_cache_select = rearrange(
-    #             v_cache_paged[block_table.to(dtype=torch.long).flatten()],
-    #             "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-    #             b=batch_size,
-    #         )[:, :seqlen_k]
-    #     assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
-    #     assert torch.equal(v_cache_select, v_cache_ref)
-    # mult = 3 if not alibi else 5
-    # assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
