@@ -271,6 +271,9 @@ def time_fwd_bwd(func, *args, **kwargs):
     return time_f[1].mean, time_b[1].mean
 
 
+"""
+copy from flash_attn.tests.test_flash_attn.py
+"""
 def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype):
     num_blocks = math.ceil(seqlen_k / paged_kv_block_size) * batch_size * 3
     k_cache_paged = torch.randn(
@@ -300,7 +303,7 @@ def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k,
 
 repeats = 30
 device = 'cuda'
-dtype = torch.float16
+dtype = torch.bfloat16
 
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 seqlen_qk = [

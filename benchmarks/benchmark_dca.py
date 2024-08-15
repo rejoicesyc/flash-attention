@@ -12,21 +12,22 @@ from flash_attn.utils.benchmark import benchmark_all, benchmark_forward, benchma
 from flash_attn.utils.benchmark import benchmark_fwd_bwd, benchmark_combined
 
 from flash_attn import flash_attn_qkvpacked_func
-from flash_attn import flash_attn_func, flash_attn_varlen_func
+from vllm_flash_attn import flash_attn_func, flash_attn_varlen_func
 from flash_attn import flash_dca_varlen_func
+from flash_attn.bert_padding import pad_input, unpad_input
 
 import nvtx
 
-try:
-    from triton.ops.flash_attention import attention as attention_triton
-except ImportError:
-    attention_triton = None
+# try:
+#     from triton.ops.flash_attention import attention as attention_triton
+# except ImportError:
+#     attention_triton = None
 
 
-try:
-    import xformers.ops as xops
-except ImportError:
-    xops = None
+# try:
+#     import xformers.ops as xops
+# except ImportError:
+#     xops = None
 
 
 """
@@ -101,7 +102,7 @@ def _bruteforce_dynamic_chunk_flash_attn_func(
             lse_s = torch.exp(stable_logits).detach()
             lse_sum = torch.sum(lse_s, dim=0)
             lse_s /= lse_sum
-            attn_outputs *= lse_s.unsqueeze(-1).transpose(1, 2).squeeze(1) # match shape with flash-attn instead of vllm-flash-attn
+            attn_outputs *= lse_s.unsqueeze(-1).transpose(1, 2).squeeze(1) # fixup shape
             attn_outputs_all.append(attn_outputs.sum(dim=0))
         return torch.cat(attn_outputs_all, dim=0)
 
@@ -328,13 +329,13 @@ def time_fwd_bwd(func, *args, **kwargs):
     return time_f[1].mean, time_b[1].mean
 
 
-repeats = 50
+repeats = 1
 device = 'cuda'
-dtype = torch.float16
+dtype = torch.bfloat16
 
 #bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 #bs_seqlen_vals = [(32, 512), (16, 1024), (8, 4096), (4, 8192), (2, 16384), (1, 32768)]
-bs_seqlen_vals = [(1, 16384), (1, 32768), (1, 64 * 1024), (1, 128 * 1024)]
+bs_seqlen_vals = [(1, 32 * 1024)]
 # bs_seqlen_vals = [(1, 32768), (1, 128 * 1024), (1, 512 * 1024)]
 # bs_seqlen_vals = [(1, 128 * 1024), (1, 512 * 1024)]
 causal_vals = [True]
@@ -343,9 +344,9 @@ dim = 2048
 dropout_p = 0.0
 
 methods = (["Flash2", "flash_dca_varlen_func"]
-           + (["Triton"] if attention_triton is not None else [])
-           + ["triton_dca_bhtd"]
-           + ['dca']
+        #    + (["Triton"] if attention_triton is not None else [])
+        #    + ["triton_dca_bhtd"]
+        #    + ['dca']
         )
 
 time_f = {}
@@ -364,20 +365,40 @@ for causal in causal_vals:
             for chunk_size in chunk_lens:
                 config = (causal, headdim, batch_size, seqlen)
                 nheads = dim // headdim
+                seqlen_q = seqlen_k = seqlen
 
                 if (chunk_size - local_size) * 2 > seqlen:
                     continue
 
-                cu_seqlens_q = torch.tensor(
-                    [seqlen], # we use full mask 
-                    dtype=torch.int32,
-                    device=device,
-                )
-                cu_seqlens_k = torch.tensor(
-                    [seqlen], # we use full mask 
-                    dtype=torch.int32,
-                    device=device,
-                )
+                # q = torch.randn(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype, requires_grad=False)
+
+                # k = torch.randn(
+                #     batch_size, seqlen_k, nheads, headdim, device=device, dtype=dtype, requires_grad=False
+                # )
+                # v = torch.randn(
+                #     batch_size, seqlen_k, nheads, headdim, device=device, dtype=dtype, requires_grad=False
+                # )
+                # block_table = None
+
+                # query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="full")
+                # # query_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
+                # (
+                #     q,
+                #     k,
+                #     v,
+                #     cu_seqlens_q,
+                #     cu_seqlens_k,
+                #     max_seqlen_q,
+                #     max_seqlen_k,
+                #     q,
+                #     k,
+                #     v,
+                #     output_pad_fn,
+                #     dq_pad_fn,
+                #     dk_pad_fn,
+                # ) = generate_qkv(q, k, v, query_padding_mask, query_padding_mask, kvpacked=False)
+                # q_succ = torch.randn_like(q)
+                # q_inter = torch.randn_like(q)
 
                 qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device=device, dtype=dtype,
                               requires_grad=False)
@@ -404,6 +425,12 @@ for causal in causal_vals:
                 if 'flash_dca_varlen_func' in methods:
                     q, q_succ, q_inter, k, v = [torch.randn(batch_size * seqlen, nheads, headdim, device=device, dtype=dtype,
                                                 requires_grad=False) for _ in range(5)]
+                    cu_seqlens_qk = torch.tensor(
+                        [0] + [seqlen] * batch_size, # we use full mask 
+                        dtype=torch.int32,
+                        device=q.device,
+                    )
+                    cu_seqlens_qk = torch.cumsum(cu_seqlens_qk, dim=0).to(torch.int32)
                     f = time_fwd(
                         flash_dca_varlen_func,
                         q,
@@ -411,8 +438,8 @@ for causal in causal_vals:
                         q_inter,
                         k,
                         v,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
+                        cu_seqlens_qk,
+                        cu_seqlens_qk,
                         seqlen, #max_seqlen_q,
                         seqlen, #max_seqlen_k,
                         chunk_size,
@@ -429,7 +456,12 @@ for causal in causal_vals:
                 if 'dca' in methods:
                     q, q_succ, q_inter, k, v = [torch.randn(batch_size * seqlen, nheads, headdim, device=device, dtype=dtype,
                                                 requires_grad=False) for _ in range(5)]
-                
+                    cu_seqlens_qk = torch.tensor(
+                        [0] + [seqlen] * batch_size, # we use full mask 
+                        dtype=torch.int32,
+                        device=q.device,
+                    )
+                    cu_seqlens_qk = torch.cumsum(cu_seqlens_qk, dim=0).to(torch.int32)
                     f = time_fwd(
                         _bruteforce_dynamic_chunk_flash_attn_varlen_func,
                         q,
@@ -437,15 +469,13 @@ for causal in causal_vals:
                         q_inter,
                         k,
                         v,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
+                        cu_seqlens_qk,
+                        cu_seqlens_qk,
                         seqlen,
                         seqlen,
                         softmax_scale=None,
                         causal=causal,
-                        # window_size=window_size,
+                        window_size=(-1, -1),
                         alibi_slopes=None,
                         chunk_size=chunk_size,
                         local_size=local_size,

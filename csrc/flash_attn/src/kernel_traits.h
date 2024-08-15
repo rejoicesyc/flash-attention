@@ -105,7 +105,7 @@ struct Flash_fwd_kernel_traits : public Base {
     using SmemCopyAtomO = Copy_Atom<DefaultCopy, Element>;
     using SmemCopyAtomOaccum = Copy_Atom<DefaultCopy, ElementAccum>;
 
-    static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element) * (Is_DCA ? 3 : 1);
+    static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element); // * (Is_DCA ? 3 : 1);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
     static constexpr int kSmemSize = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
 
