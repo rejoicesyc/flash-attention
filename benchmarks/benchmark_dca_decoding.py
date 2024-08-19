@@ -403,7 +403,7 @@ for (chunk_size, local_size), causal, headdim, (seqlen_q, seqlen_k), new_kv, pag
         device=device,
     )
     cache_seqlens = torch.tensor(
-        [k_cache.shape[1]],
+        [k_cache.shape[1]], # we use full mask 
         dtype=torch.int32,
         device=q.device,
     )

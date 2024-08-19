@@ -308,8 +308,7 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     #pragma unroll
     for (int m = 0; m < size<1>(S); ++m) {
         const int actual_mn = get<0>(identity_MN(0, m, 0));
-        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
-        // if (Is_even_MN || actual_mn < max_MN && actual_mn > min_MN) {
+        if (Is_even_MN || actual_mn < max_MN && actual_mn >= min_MN) {
             #pragma unroll
             for (int k = 0; k < size<2>(S); ++k) {
                 if (Is_even_K || predicate_K(k)) {
