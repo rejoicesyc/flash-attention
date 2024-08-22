@@ -298,9 +298,9 @@ def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k,
     return k_cache, v_cache, block_table, k_cache_paged, v_cache_paged, num_blocks
 
 
-repeats = 30
+repeats = 1
 device = 'cuda'
-dtype = torch.float16
+dtype = torch.bfloat16
 
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 seqlen_qk = [
@@ -312,11 +312,11 @@ seqlen_qk = [
     # (3, 799),
     # (64, 2048),
     # (16, 20000),
-    (1, 32 * 1024),
-    (1, 64 * 1024),
-    (1, 128 * 1024),
+    # (1, 32 * 1024),
+    # (1, 64 * 1024),
+    # (1, 128 * 1024),
     (1, 512 * 1024),
-    (1, 1024 * 1024)
+    # (1, 1024 * 1024)
     # (128, 128),
 ]
 paged_kv_block_sizes = [1024]
@@ -331,9 +331,11 @@ methods = [
     'flash_attn_with_kvcache',
     'flash_dca_with_kvcache',
     # 'paged_attention_v2',
-    'dca_decode',
+    # 'dca_decode',
 ]
-chunk_infos = [(8 * 1024, 0), (32 * 1024, 0)]
+chunk_infos = [
+        # (8 * 1024, 0), 
+        (32 * 1024, 0)]
 
 time_f = {}
 time_b = {}

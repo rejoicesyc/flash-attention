@@ -9,6 +9,7 @@
 #include "static_switch.h"
 #include "flash.h"
 #include "dca_fwd_kernel.h"
+#include "flash_fwd_kernel.h"
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -26,10 +27,10 @@
 template<typename Kernel_traits, __VA_ARGS__> \
 __global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_dca_fwd_params params)
 
-DEFINE_FLASH_DCA_FORWARD_KERNEL(dca_fwd_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
+DEFINE_FLASH_DCA_FORWARD_KERNEL(dca_fwd_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool uniform_softmax) {
     #if defined(ARCH_SUPPORTS_FLASH)
         static_assert(!(Is_causal && Is_local)); // Enforce constraints
-        flash::compute_dca<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params);
+        flash::compute_dca<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, uniform_softmax>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -43,12 +44,16 @@ DEFINE_FLASH_DCA_FORWARD_KERNEL(dca_fwd_splitkv_kernel, bool Is_causal, bool Is_
     #endif
 }
 
-DEFINE_FLASH_DCA_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int Log_max_splits, bool Is_even_K) {
+DEFINE_FLASH_DCA_FORWARD_KERNEL(dca_fwd_splitkv_combine_kernel, int kBlockM, int Log_max_splits, bool Is_even_K, bool uniform_softmax) {
     static_assert(Log_max_splits >= 1);
-    flash::combine_dca_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
+    if constexpr (uniform_softmax) {
+        flash::combine_flash_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
+    } else {
+        flash::combine_dca_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
+    }
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool uniform_softmax>
 void run_dca_fwd(Flash_dca_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     // printf("smem_size = %d\n", smem_size);
@@ -73,7 +78,7 @@ void run_dca_fwd(Flash_dca_fwd_params &params, cudaStream_t stream) {
                             // If return_softmax, set IsEvenMNConst to false to reduce number of templates
                             // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
                             // If Is_local, set Is_causal to false
-                            auto kernel = &dca_fwd_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, ReturnSoftmaxConst && Is_dropout && !Is_softcap>;
+                            auto kernel = &dca_fwd_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, ReturnSoftmaxConst && Is_dropout && !Is_softcap, uniform_softmax>;
                             // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, false, true, true, false>;
                             // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
                             // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
@@ -95,7 +100,7 @@ void run_dca_fwd(Flash_dca_fwd_params &params, cudaStream_t stream) {
     });
 }
 
-template<typename Kernel_traits, bool Is_causal>
+template<typename Kernel_traits, bool Is_causal, bool uniform_softmax>
 void run_dca_splitkv_fwd(Flash_dca_fwd_params &params, cudaStream_t stream) {
     static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
@@ -138,33 +143,33 @@ void run_dca_splitkv_fwd(Flash_dca_fwd_params &params, cudaStream_t stream) {
         dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
             if (params.num_splits <= 2) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 4) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 8) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 16) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 32) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 64) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 128) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
     }
 }
 
-template<typename T, int Headdim, bool Is_causal>
+template<typename T, int Headdim, bool Is_causal, bool uniform_softmax>
 void run_dca_fwd_splitkv_dispatch(Flash_dca_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockM = 64;  // Fixed for all head dimensions
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
     // Also for headdim 160 with block size 64 x 128 after the rotary addition.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
-    run_dca_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T, false>, Is_causal>(params, stream);
+    run_dca_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T, false, uniform_softmax>, Is_causal, uniform_softmax>(params, stream);
 }
 
 /*
@@ -221,13 +226,13 @@ void run_mha_fwd_hdim96(Flash_dca_fwd_params &params, cudaStream_t stream) {
 }
 */
 
-template<typename T, bool Is_causal>
+template<typename T, bool Is_causal, bool uniform_softmax>
 void run_dca_fwd_hdim128(Flash_dca_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major == 8 && dprops->minor > 0;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_dca_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T, true>, Is_dropout, Is_causal>(params, stream);
+        run_dca_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T, true, uniform_softmax>, Is_dropout, Is_causal, uniform_softmax>(params, stream);
         // if constexpr(!Is_dropout) {
         //     // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
         //     // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.

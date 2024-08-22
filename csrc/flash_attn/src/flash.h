@@ -144,6 +144,8 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+
+    bool experimental_uniform_softmax; // wheather to use uniform softmax
 };
 
 struct Flash_dca_fwd_params: public Flash_fwd_params {
@@ -205,5 +207,5 @@ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispa
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 
-template<typename T, int Headdim, bool Is_causal> void run_dca_fwd_(Flash_dca_fwd_params &params, cudaStream_t stream);
-template<typename T, int Headdim, bool Is_causal> void run_dca_fwd_splitkv_dispatch(Flash_dca_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal, bool uniform_softmax> void run_dca_fwd_(Flash_dca_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal, bool uniform_softmax> void run_dca_fwd_splitkv_dispatch(Flash_dca_fwd_params &params, cudaStream_t stream);

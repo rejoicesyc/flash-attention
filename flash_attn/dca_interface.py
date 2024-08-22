@@ -30,6 +30,7 @@ def flash_dca_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
+    experimental_uniform_softmax=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -79,6 +80,7 @@ def flash_dca_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        experimental_uniform_softmax: bool. Use uniform softmax for all three chunks.
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -124,6 +126,7 @@ def flash_dca_varlen_func(
         softcap,
         False, #return_softmax,
         None,
+        experimental_uniform_softmax,
     )
     return out
 
@@ -152,6 +155,7 @@ def flash_dca_with_kvcache(
     alibi_slopes=None,
     num_splits=0,
     return_softmax_lse=False,
+    experimental_uniform_softmax=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -233,6 +237,7 @@ def flash_dca_with_kvcache(
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
+        experimental_uniform_softmax: bool. Use uniform softmax for all three chunks.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
@@ -282,5 +287,6 @@ def flash_dca_with_kvcache(
         softcap,
         rotary_interleaved,
         num_splits,
+        experimental_uniform_softmax,
     )
     return (out, softmax_lse) if return_softmax_lse else out

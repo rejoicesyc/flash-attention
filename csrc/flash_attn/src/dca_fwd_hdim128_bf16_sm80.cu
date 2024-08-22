@@ -3,4 +3,8 @@
 // This file is auto-generated. See "generate_kernels.py"
 
 #include "dac_fwd_launch_template.h"
-template void run_dca_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, False, false>(Flash_dca_fwd_params &params, cudaStream_t stream);
+
+template<>
+void run_dca_fwd_<cutlass::bfloat16_t, 128, True, false>(Flash_dca_fwd_params &params, cudaStream_t stream) {
+    run_dca_fwd_hdim128<cutlass::bfloat16_t, True, false>(params, stream);
+}

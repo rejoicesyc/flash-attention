@@ -329,14 +329,14 @@ def time_fwd_bwd(func, *args, **kwargs):
     return time_f[1].mean, time_b[1].mean
 
 
-repeats = 30
+repeats = 1
 device = 'cuda'
 dtype = torch.bfloat16
 
 #bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 #bs_seqlen_vals = [(32, 512), (16, 1024), (8, 4096), (4, 8192), (2, 16384), (1, 32768)]
-#bs_seqlen_vals = [(1, 32 * 1024)]
-bs_seqlen_vals = [(4, 8192), (2, 16 * 1024), (1, 32768), (1, 65536), (1, 128 * 1024), (1, 512 * 1024)]
+bs_seqlen_vals = [(1, 32 * 1024)]
+# bs_seqlen_vals = [(4, 8192), (2, 16 * 1024), (1, 32768), (1, 65536), (1, 128 * 1024), (1, 512 * 1024)]
 # bs_seqlen_vals = [(1, 128 * 1024), (1, 512 * 1024)]
 causal_vals = [True]
 headdim_vals = [128]
@@ -346,7 +346,7 @@ dropout_p = 0.0
 methods = (["Flash2", "flash_dca_varlen_func"]
         #    + (["Triton"] if attention_triton is not None else [])
         #    + ["triton_dca_bhtd"]
-            + ['dca']
+            # + ['dca']
         )
 
 time_f = {}

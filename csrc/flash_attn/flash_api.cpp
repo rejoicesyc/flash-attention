@@ -183,6 +183,7 @@ void set_params_dca_fwd(Flash_dca_fwd_params &params,
                         int window_size_right,
                         const float softcap,
                         bool seqlenq_ngroups_swapped=false,
+                        const bool experimental_uniform_softmax=false,
                         const bool unpadded_lse=false) {
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -203,6 +204,7 @@ void set_params_dca_fwd(Flash_dca_fwd_params &params,
     params.q_succ_ptr = q_succ.data_ptr();
     params.q_inter_ptr = q_inter.data_ptr();
     params.chunk_len = chunk_len;
+    params.experimental_uniform_softmax = experimental_uniform_softmax;
 } 
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -894,11 +896,13 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 void run_dca_fwd(Flash_dca_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
     FP16_SWITCH(!params.is_bf16, [&] {
         DCA_HEADDIM_SWITCH(params.d, [&] {
-            if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                run_dca_fwd_<elem_type, kHeadDim, /*Is_causal*/true>(params, stream);
-            } else {
-                run_dca_fwd_splitkv_dispatch<elem_type, kHeadDim, /*Is_causal*/false>(params, stream);
-            }
+            BOOL_SWITCH(params.experimental_uniform_softmax, uniform_softmax, [&] {
+                if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+                    run_dca_fwd_<elem_type, kHeadDim, /*Is_causal*/true, uniform_softmax>(params, stream);
+                } else {
+                    run_dca_fwd_splitkv_dispatch<elem_type, kHeadDim, /*Is_causal*/false, uniform_softmax>(params, stream);
+                }
+            });
         });
     });
 }
@@ -928,6 +932,7 @@ dca_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
+               const bool experimental_uniform_softmax,
                c10::optional<at::Generator> gen_) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1112,6 +1117,7 @@ dca_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                        window_size_right,
                        softcap,
                        seqlenq_ngroups_swapped,
+                       experimental_uniform_softmax,
                        /*unpadded_lse*/true);
     params.total_q = total_q;
 
@@ -1991,7 +1997,8 @@ dca_fwd_kvcache(at::Tensor &q,                       // batch_size x seqlen_q x 
                 int window_size_right,
                 const float softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
+                int num_splits,
+                const bool experimental_uniform_softmax
                 ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -2142,7 +2149,8 @@ dca_fwd_kvcache(at::Tensor &q,                       // batch_size x seqlen_q x 
                        chunk_len,
                        window_size_left,
                        window_size_right,
-                       softcap
+                       softcap,
+                       experimental_uniform_softmax
                        );
 
     at::Tensor k, v, k_padded, v_padded;

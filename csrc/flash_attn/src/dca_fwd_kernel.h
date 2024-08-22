@@ -209,8 +209,8 @@ __forceinline__ __device__ void copy_acc2smem(Tensor0 &sQ, Tensor1 &acc_o) {
 
 
 template <typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, 
-          bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params, 
-          typename ChunkSoftmax, typename TensorAcc, typename TensorLSE,
+          bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, need_first_softmax,
+          typename Params, typename ChunkSoftmax, typename TensorAcc, typename TensorLSE,
           typename TensorQ0, typename TensorQ1, typename TensorQ2, typename TensorQ3,
           typename TensorK0, typename TensorK1, typename TensorK2, typename TensorK3,
           typename TensorV0, typename TensorV1, typename TensorV2, typename TensorV3, 
@@ -393,13 +393,13 @@ __forceinline__ __device__ void compute_attn_1rowchunk_kernel(
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
+            ? softmax.template softmax_rescale_o</*Is_first=*/need_first_softmax, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = flash::convert_type<Element>(acc_s);
-        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
-        int block_col_idx = n_block * (kBlockN / 32);
+        // int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+        // int block_col_idx = n_block * (kBlockN / 32);
         // if (Return_softmax) {
         //     Tensor rP_drop = make_fragment_like(rP);
         //     cute::copy(rP, rP_drop);
@@ -493,7 +493,7 @@ __forceinline__ __device__ void compute_attn_1rowchunk_kernel(
 
 
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool uniform_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -616,9 +616,9 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     Tensor sQ_intra = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                                   typename Kernel_traits::SmemLayoutQ{});
-    Tensor sQ_succ = make_tensor(sQ_intra.data() + size(sQ_intra),
+    Tensor sQ_succ = make_tensor(sQ_intra.data() + (uniform_softmax ? 0 : size(sQ_intra)),
                                  typename Kernel_traits::SmemLayoutQ{});
-    Tensor sQ_inter = make_tensor(sQ_succ.data() + size(sQ_succ),
+    Tensor sQ_inter = make_tensor(sQ_succ.data() + (uniform_softmax ? 0 : size(sQ_succ)),
                                   typename Kernel_traits::SmemLayoutQ{});
     // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
     Tensor sK = make_tensor(sQ_inter.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ_inter)),
@@ -675,43 +675,60 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     using TensorLSE = decltype(make_tensor<float>(Shape<Int<2 * size<1>(acc_o)>>{}));
     // auto lse_shape = Shape<Int<2 * 2 * size<1>(acc_o)>>{};
     TensorLSE lse_intra, lse_succ, lse_inter;
-    cute::fill(lse_intra, -INFINITY);
-    clear(acc_o);
-    if (n_block_max_intra > n_block_min_intra) {
-        // const int actual_seqlen_k_min = 
-        // compute_attn_1rowchunk(tQgQ_intra, tQsQ_intra, tSrQ_intra, sQ_intra, n_block_min_intra, n_block_max_intra, lse_intra);
-        compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
-                softmax, acc_o, lse_intra, tQgQ_intra, tQsQ_intra, tSrQ_intra, sQ_intra,
-                tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
-                tSgS, binfo, params, n_block_min_intra, n_block_max_intra, bidb, bidh, m_block);
-        // if (cute::thread0()) {
-        //     printf("check acc_o inside intra condition\n");
-        //     print_tensor(acc_o);
-        // }
+    
+    if constexpr (uniform_softmax) {
+        cute::fill(lse_intra, -INFINITY);
+        clear(acc_o);
+        if (n_block_max_intra > n_block_min_intra) {
+            compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, true>(
+                    softmax, acc_o, lse_intra, tQgQ_intra, tQsQ_intra, tSrQ_intra, sQ_intra,
+                    tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
+                    tSgS, binfo, params, n_block_min_intra, n_block_max_intra, bidb, bidh, m_block);
+        }
+        if (n_block_max_succ > n_block_min_succ) {
+            compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, false>(
+                    softmax, acc_o, lse_, tQgQ_succ, tQsQ_succ, tSrQ_succ, sQ_succ,
+                    tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
+                    tSgS, binfo, params, n_block_min_succ, n_block_max_succ, bidb, bidh, m_block);
+        }
+        if (n_block_max_inter > n_block_min_inter) {
+            compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, false>(
+                    softmax, acc_o, lse_intra, tQgQ_inter, tQsQ_inter, tSrQ_inter, sQ_inter,
+                    tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
+                    tSgS, binfo, params, n_block_min_inter, n_block_max_inter, bidb, bidh, m_block);
+        } 
+        copy_acc2smem<Kernel_traits>(sQ_intra, acc_o);
+    } else {
+        cute::fill(lse_intra, -INFINITY);
+        clear(acc_o);
+        if (n_block_max_intra > n_block_min_intra) {
+            compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, true>(
+                    softmax, acc_o, lse_intra, tQgQ_intra, tQsQ_intra, tSrQ_intra, sQ_intra,
+                    tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
+                    tSgS, binfo, params, n_block_min_intra, n_block_max_intra, bidb, bidh, m_block);
+        }
+        copy_acc2smem<Kernel_traits>(sQ_intra, acc_o);
+
+        cute::fill(lse_succ, -INFINITY);
+        clear(acc_o);
+        if (n_block_max_succ > n_block_min_succ) {
+            compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, true>(
+                    softmax, acc_o, lse_succ, tQgQ_succ, tQsQ_succ, tSrQ_succ, sQ_succ,
+                    tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
+                    tSgS, binfo, params, n_block_min_succ, n_block_max_succ, bidb, bidh, m_block);
+        } 
+        copy_acc2smem<Kernel_traits>(sQ_succ, acc_o);
+
+        cute::fill(lse_inter, -INFINITY);
+        clear(acc_o);
+        if (n_block_max_inter > n_block_min_inter) {
+            compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, true>(
+                    softmax, acc_o, lse_inter, tQgQ_inter, tQsQ_inter, tSrQ_inter, sQ_inter,
+                    tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
+                    tSgS, binfo, params, n_block_min_inter, n_block_max_inter, bidb, bidh, m_block);
+        } 
+        copy_acc2smem<Kernel_traits>(sQ_inter, acc_o);
     }
-    copy_acc2smem<Kernel_traits>(sQ_intra, acc_o);
-
-    cute::fill(lse_succ, -INFINITY);
-    clear(acc_o);
-    if (n_block_max_succ > n_block_min_succ) {
-        // compute_attn_1rowchunk(tQgQ_succ, tQsQ_succ, tSrQ_succ, sQ_succ, n_block_min_succ, n_block_max_succ, lse_succ);
-        compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
-                softmax, acc_o, lse_succ, tQgQ_succ, tQsQ_succ, tSrQ_succ, sQ_succ,
-                tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
-                tSgS, binfo, params, n_block_min_succ, n_block_max_succ, bidb, bidh, m_block);
-    } 
-    copy_acc2smem<Kernel_traits>(sQ_succ, acc_o);
-
-    cute::fill(lse_inter, -INFINITY);
-    clear(acc_o);
-    if (n_block_max_inter > n_block_min_inter) {
-        // compute_attn_1rowchunk(tQgQ_inter, tQsQ_inter, tSrQ_inter, sQ_inter, n_block_min_inter, n_block_max_inter, lse_inter);
-        compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
-                softmax, acc_o, lse_inter, tQgQ_inter, tQsQ_inter, tSrQ_inter, sQ_inter,
-                tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
-                tSgS, binfo, params, n_block_min_inter, n_block_max_inter, bidb, bidh, m_block);
-    } 
-    copy_acc2smem<Kernel_traits>(sQ_inter, acc_o);
 
     // __syncthreads();
     // if (cute::thread0()) {
@@ -725,8 +742,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
     // auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
-    flash::dca_softmax<2 * size<1>(acc_o), Kernel_traits>(acc_o, sQ_intra, sQ_succ, sQ_inter, 
-                                                          lse_intra, lse_succ, lse_inter, tidx);
+    if constexpr (!uniform_softmax) {
+        flash::dca_softmax<2 * size<1>(acc_o), Kernel_traits>(acc_o, sQ_intra, sQ_succ, sQ_inter, 
+                                                              lse_intra, lse_succ, lse_inter, tidx);
+    }
 
     Tensor mO = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
                                           + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
@@ -1397,7 +1416,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool uniform_softmax, typename Params>
 inline __device__ void compute_dca(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1413,7 +1432,7 @@ inline __device__ void compute_dca(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, uniform_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
