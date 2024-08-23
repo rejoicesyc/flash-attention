@@ -335,18 +335,18 @@ dtype = torch.bfloat16
 
 #bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 #bs_seqlen_vals = [(32, 512), (16, 1024), (8, 4096), (4, 8192), (2, 16384), (1, 32768)]
-bs_seqlen_vals = [(1, 32 * 1024)]
-# bs_seqlen_vals = [(4, 8192), (2, 16 * 1024), (1, 32768), (1, 65536), (1, 128 * 1024), (1, 512 * 1024)]
+# bs_seqlen_vals = [(1, 32 * 1024)]
+bs_seqlen_vals = [(4, 8192), (2, 16 * 1024), (1, 32768), (1, 65536), (1, 128 * 1024), (1, 512 * 1024)]
 # bs_seqlen_vals = [(1, 128 * 1024), (1, 512 * 1024)]
 causal_vals = [True]
 headdim_vals = [128]
 dim = 2048
 dropout_p = 0.0
 
-methods = (["Flash2", "flash_dca_varlen_func"]
+methods = (["Flash2", "flash_dca_varlen_func", "flash_dca2"]
         #    + (["Triton"] if attention_triton is not None else [])
         #    + ["triton_dca_bhtd"]
-            # + ['dca']
+            + ['dca']
         )
 
 time_f = {}
@@ -452,6 +452,38 @@ for causal in causal_vals:
                         verbose=False
                     )
                     time_f[config, 'flash_dca_varlen_func'] = f 
+
+                if 'flash_dca2' in methods:
+                    q, q_succ, q_inter, k, v = [torch.randn(batch_size * seqlen, nheads, headdim, device=device, dtype=dtype,
+                                                requires_grad=False) for _ in range(5)]
+                    cu_seqlens_qk = torch.tensor(
+                        [0] + [seqlen] * batch_size, # we use full mask 
+                        dtype=torch.int32,
+                        device=q.device,
+                    )
+                    cu_seqlens_qk = torch.cumsum(cu_seqlens_qk, dim=0).to(torch.int32)
+                    f = time_fwd(
+                        flash_dca_varlen_func,
+                        q,
+                        q_succ,
+                        q_inter,
+                        k,
+                        v,
+                        cu_seqlens_qk,
+                        cu_seqlens_qk,
+                        seqlen, #max_seqlen_q,
+                        seqlen, #max_seqlen_k,
+                        chunk_size,
+                        local_size,
+                        0.0,
+                        causal=causal,
+                        # window_size=window_size,
+                        # block_table=block_table,
+                        experimental_uniform_softmax=True,
+                        repeats=repeats, 
+                        verbose=False
+                    )
+                    time_f[config, 'flash_dca2'] = f 
 
                 if 'dca' in methods:
                     q, q_succ, q_inter, k, v = [torch.randn(batch_size * seqlen, nheads, headdim, device=device, dtype=dtype,

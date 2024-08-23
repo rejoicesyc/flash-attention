@@ -28,7 +28,7 @@ namespace {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
-__forceinline__ __device__ auto get_lse_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
+__forceinline__ __device__ auto dca_get_lse_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
         // When params.unpadded_lse is false, LSE is written as (b, h, seqlen_q) - this is non-variable seqlen path.
         // Otherwise, when params.seqlenq_ngroups_swapped is true, it is written as (h, seqlen_q, b) to account for seqlen_q <-> h swapping trick.
         // Otherwise, it's written as (h, b, seqlen_q).
@@ -209,7 +209,7 @@ __forceinline__ __device__ void copy_acc2smem(Tensor0 &sQ, Tensor1 &acc_o) {
 
 
 template <typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, 
-          bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, need_first_softmax,
+          bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool need_first_softmax,
           typename Params, typename ChunkSoftmax, typename TensorAcc, typename TensorLSE,
           typename TensorQ0, typename TensorQ1, typename TensorQ2, typename TensorQ3,
           typename TensorK0, typename TensorK1, typename TensorK2, typename TensorK3,
@@ -494,7 +494,7 @@ __forceinline__ __device__ void compute_attn_1rowchunk_kernel(
 
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool uniform_softmax, typename Params>
-inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
+inline __device__ void dca_compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -544,7 +544,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                               make_coord(m_block, 0));  // (kBlockM, kHeadDim)
 
-        Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+        Tensor gLSE = dca_get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
         typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
@@ -687,7 +687,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         if (n_block_max_succ > n_block_min_succ) {
             compute_attn_1rowchunk_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, false>(
-                    softmax, acc_o, lse_, tQgQ_succ, tQsQ_succ, tSrQ_succ, sQ_succ,
+                    softmax, acc_o, lse_succ, tQgQ_succ, tQsQ_succ, tSrQ_succ, sQ_succ,
                     tKgK, tKsK, tSrK, sK, tVgV, tVsV, tOrVt, sVt, 
                     tSgS, binfo, params, n_block_min_succ, n_block_max_succ, bidb, bidh, m_block);
         }
@@ -753,7 +753,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.o_row_stride, params.o_head_stride, _1{}));
     Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
-    // Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+    // Tensor gLSE = dca_get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
 
     typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
@@ -798,7 +798,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
-inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
+inline __device__ void dca_compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -1432,7 +1432,7 @@ inline __device__ void compute_dca(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, uniform_softmax>(params, bidb, bidh, m_block);
+    flash::dca_compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, uniform_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1446,7 +1446,7 @@ inline __device__ void compute_dca_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::dca_compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1480,7 +1480,7 @@ inline __device__ void combine_dca_seqk_parallel(const Params &params) {
                                    Shape<Int<kMaxSplits>, Int<kBlockM>>{},
                                    make_stride(lse_size, _1{}));
 
-    // LSE format is different depending on params.unpadded_lse and params.seqlenq_ngroups_swapped, see comment in get_lse_tile.
+    // LSE format is different depending on params.unpadded_lse and params.seqlenq_ngroups_swapped, see comment in dca_get_lse_tile.
     // This tensor's layout maps row_offset_lse to {bidb, bidh, q_offset}.
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<Int<kBlockM>>{}, Stride<_1>{});

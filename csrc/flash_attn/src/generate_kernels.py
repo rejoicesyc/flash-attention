@@ -41,7 +41,7 @@ void run_mha_bwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cu
 }}
 """
 
-KERNEL_IMPL_TEMPLATE_DCA = """#include "dac_fwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_DCA = """#include "dca_fwd_launch_template.h"
 
 template<>
 void run_dca_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}, {UNIFORM_SOFTMAX}>(Flash_dca_fwd_params &params, cudaStream_t stream) {{
@@ -49,7 +49,7 @@ void run_dca_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}, {UNIFORM_SOFTMAX}>(Flash_dca
 }}
 """
 
-KERNEL_IMPL_TEMPLATE_DCA_SPLIT = """#include "dac_fwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_DCA_SPLIT = """#include "dca_fwd_launch_template.h"
 template void run_dca_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}, {UNIFORM_SOFTMAX}>(Flash_dca_fwd_params &params, cudaStream_t stream);
 """
 
@@ -59,9 +59,9 @@ class Kernel:
     sm: int
     dtype: str
     head_dim: int
-    is_causal: bool
+    is_causal: str
     direction: str
-    uniform_softmax: bool = False
+    uniform_softmax: str = 'false'
 
     @property
     def template(self) -> str:
@@ -99,10 +99,10 @@ def get_all_kernels() -> List[Kernel]:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=is_causal, direction=direction)
 
     for dtype, head_dim, sm, uniform_softmax in itertools.product(DTYPE_MAP.keys(), DCA_HEAD_DIMENSIONS, SM, UNIFORM_SOFTMAX):
-        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=True, direction='dca_fwd', uniform_softmax=uniform_softmax)
+        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal="true", direction='dca_fwd', uniform_softmax=uniform_softmax)
 
     for dtype, head_dim, sm, uniform_softmax in itertools.product(DTYPE_MAP.keys(), DCA_HEAD_DIMENSIONS, SM, UNIFORM_SOFTMAX):
-        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=False, direction='dca_fwd_split', uniform_softmax=uniform_softmax)
+        yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal='false', direction='dca_fwd_split', uniform_softmax=uniform_softmax)
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
     prelude = """// Copyright (c) 2024, Tri Dao.
@@ -119,6 +119,8 @@ def main(output_dir: Optional[str]) -> None:
         output_dir = Path(output_dir)
 
     for kernel in get_all_kernels():
+        print(kernel)
+        print(kernel.template)
         write_kernel(kernel, output_dir)
 
 

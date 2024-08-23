@@ -47,7 +47,7 @@ DEFINE_FLASH_DCA_FORWARD_KERNEL(dca_fwd_splitkv_kernel, bool Is_causal, bool Is_
 DEFINE_FLASH_DCA_FORWARD_KERNEL(dca_fwd_splitkv_combine_kernel, int kBlockM, int Log_max_splits, bool Is_even_K, bool uniform_softmax) {
     static_assert(Log_max_splits >= 1);
     if constexpr (uniform_softmax) {
-        flash::combine_flash_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
+        flash::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
     } else {
         flash::combine_dca_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
     }
@@ -143,19 +143,19 @@ void run_dca_splitkv_fwd(Flash_dca_fwd_params &params, cudaStream_t stream) {
         dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
             if (params.num_splits <= 2) {
-                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst, uniform_softmax><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 4) {
-                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst, uniform_softmax><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 8) {
-                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst, uniform_softmax><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 16) {
-                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst, uniform_softmax><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 32) {
-                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst, uniform_softmax><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 64) {
-                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst, uniform_softmax><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 128) {
-                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                dca_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst, uniform_softmax><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });

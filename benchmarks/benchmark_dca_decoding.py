@@ -312,11 +312,11 @@ seqlen_qk = [
     # (3, 799),
     # (64, 2048),
     # (16, 20000),
-    # (1, 32 * 1024),
-    # (1, 64 * 1024),
-    # (1, 128 * 1024),
+    (1, 32 * 1024),
+    (1, 64 * 1024),
+    (1, 128 * 1024),
     (1, 512 * 1024),
-    # (1, 1024 * 1024)
+    (1, 1024 * 1024)
     # (128, 128),
 ]
 paged_kv_block_sizes = [1024]
@@ -330,8 +330,9 @@ num_kv_heads = 8
 methods = [
     'flash_attn_with_kvcache',
     'flash_dca_with_kvcache',
+    'flash_dca2',
     # 'paged_attention_v2',
-    # 'dca_decode',
+    'dca_decode',
 ]
 chunk_infos = [
         # (8 * 1024, 0), 
@@ -455,6 +456,33 @@ for (chunk_size, local_size), causal, headdim, (seqlen_q, seqlen_k), new_kv, pag
             num_splits=0,
         )
         time_f[config, 'flash_dca_with_kvcache'] = f
+
+    if 'flash_dca2' in methods:
+        f = time_fwd(
+            flash_dca_with_kvcache,
+            q,
+            q_succ,
+            q_inter,
+            k_cache if paged_kv_block_size is None else k_cache_paged,
+            v_cache if paged_kv_block_size is None else v_cache_paged,
+            chunk_size,
+            local_size,
+            k,
+            v,
+            rotary_cos=None,
+            rotary_sin=None,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=None,
+            cache_leftpad=None,
+            block_table=block_table,
+            causal=causal,
+            window_size=(-1, -1),
+            rotary_interleaved=False,
+            experimental_uniform_softmax=True,
+            alibi_slopes=None,
+            num_splits=0,
+        )
+        time_f[config, 'flash_dca2'] = f
 
 
     # if 'paged_attention_v2' in methods:

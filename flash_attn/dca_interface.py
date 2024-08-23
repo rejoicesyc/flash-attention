@@ -125,8 +125,8 @@ def flash_dca_varlen_func(
         window_size[1],
         softcap,
         False, #return_softmax,
-        None,
         experimental_uniform_softmax,
+        None,
     )
     return out
 
