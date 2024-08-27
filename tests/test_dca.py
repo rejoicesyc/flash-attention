@@ -489,9 +489,11 @@ def _pagedattention_forward_decode_with_exp_sums(
 )
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
 @pytest.mark.parametrize("paged_kv_block_size", [None])
+@pytest.mark.parametrize("uniform_softmax", [False, True])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
 def test_dca_varlen_causal(
-    batch_size, seqlen_qk, nheads_q, nheads_k, d, local, paged_kv_block_size, dtype, chunk_size, local_size,
+    batch_size, seqlen_qk, nheads_q, nheads_k, d, local, paged_kv_block_size, dtype, chunk_size, 
+    local_size, uniform_softmax
 ):
     seqlen_q = seqlen_k = seqlen_qk # only support same q, k
     if (
@@ -559,6 +561,7 @@ def test_dca_varlen_causal(
         causal=causal,
         window_size=window_size,
         block_table=block_table,
+        experimental_uniform_softmax=uniform_softmax,
     )
     ref_out = _bruteforce_dynamic_chunk_flash_attn_varlen_func(
         q_unpad,
@@ -640,6 +643,7 @@ def test_dca_varlen_causal(
         (x * 1024, 0) for x in range(2, 33, 2)
     ]
 )
+@pytest.mark.parametrize("uniform_softmax", [False, True])
 def test_dca_kvcache(
     batch_size,
     seqlen_q,
@@ -660,6 +664,7 @@ def test_dca_kvcache(
     dtype,
     chunk_size,
     local_size,
+    uniform_softmax,
 ):
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
@@ -820,6 +825,7 @@ def test_dca_kvcache(
         rotary_interleaved=rotary_interleaved,
         alibi_slopes=alibi_slopes,
         num_splits=num_splits,
+        experimental_uniform_softmax=uniform_softmax,
     )
     out_ref = _bruteforce_dynamic_chunk_pageattention_forward_decode(
         q,

@@ -30,6 +30,8 @@ def flash_dca_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
+    original_max_position_embeddings=0.,
+    prefill_original_seq_lens_tensor=None,
     experimental_uniform_softmax=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -99,6 +101,15 @@ def flash_dca_varlen_func(
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+
+    # if original_max_position_embeddings > 0:
+    #     mscale = max(
+    #         0.1 * (current_prefill_original_seq_lens_tensor[0] /
+    #                 original_max_position_embeddings).log() + 1.0,
+    #         1.0,
+    #     )
+    #     softmax_scale = softmax_scale * mscale
+
     q, q_succ, q_inter, k, v = [maybe_contiguous(x) for x in (q, q_succ, q_inter, k, v)]
     out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.dca_varlen(
         q,
@@ -155,6 +166,7 @@ def flash_dca_with_kvcache(
     alibi_slopes=None,
     num_splits=0,
     return_softmax_lse=False,
+    original_max_position_embeddings=0.,
     experimental_uniform_softmax=False,
 ):
     """
@@ -245,7 +257,7 @@ def flash_dca_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert causal == False, "causal must be False"
+    # assert causal == False, "causal must be False"
     assert window_size == (-1, -1), "do not support local attn"
     assert alibi_slopes == None, "do not support alibi"
     assert softcap == 0., "do not support softcap attn"
@@ -262,6 +274,20 @@ def flash_dca_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
+
+    if original_max_position_embeddings > 0:
+        mscale = (
+            0.1 *
+            torch.log(cache_seqlens / original_max_position_embeddings) +
+            1.0).clip(min=1)
+        query = (query * mscale.view(-1, 1, 1, 1)).to(
+            query.dtype
+        )  # possible for numerical issue, need to fused in the kernel
+        query_succ = (query_succ * mscale.view(-1, 1, 1, 1)).to(
+            query.dtype)
+        query_inter = (query_inter * mscale.view(-1, 1, 1, 1)).to(
+            query.dtype)
+            
     out, softmax_lse = flash_attn_cuda.dca_kvcache(
         q,
         q_succ,

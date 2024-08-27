@@ -298,7 +298,7 @@ def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k,
     return k_cache, v_cache, block_table, k_cache_paged, v_cache_paged, num_blocks
 
 
-repeats = 1
+repeats = 20
 device = 'cuda'
 dtype = torch.bfloat16
 
