@@ -365,6 +365,7 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
             params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount * 2, num_n_blocks, 128);
         }
+        // std::cout << "params.num_splits:" << params.num_splits << std::endl;
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
             out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
@@ -897,6 +898,7 @@ void run_dca_fwd(Flash_dca_fwd_params &params, cudaStream_t stream, bool force_s
     FP16_SWITCH(!params.is_bf16, [&] {
         DCA_HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.experimental_uniform_softmax, uniform_softmax, [&] {
+                // In prefill stage, we only use casual mask in intra-chunk and judge it during runtime
                 if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
                     run_dca_fwd_<elem_type, kHeadDim, /*Is_causal*/true, uniform_softmax>(params, stream);
                 } else {
