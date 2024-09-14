@@ -169,7 +169,8 @@ void run_dca_fwd_splitkv_dispatch(Flash_dca_fwd_params &params, cudaStream_t str
     // and for headdim 192 with block size 64 x 128.
     // Also for headdim 160 with block size 64 x 128 after the rotary addition.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
-    run_dca_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T, false, uniform_softmax>, Is_causal, uniform_softmax>(params, stream);
+    //run_dca_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T, false, uniform_softmax>, Is_causal, uniform_softmax>(params, stream);
+    run_dca_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T, false, uniform_softmax>, Is_causal, uniform_softmax>(params, stream);
 }
 
 /*
@@ -230,7 +231,7 @@ template<typename T, bool Is_causal, bool uniform_softmax>
 void run_dca_fwd_hdim128(Flash_dca_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
+    // bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
     // assert(params.p_dropout >= 1.f); // dca prefill not support dropout
     // assert(is_sm8x); // dca prefill only support sm8x
     static_assert(Is_causal, "dca prefill only support causal");

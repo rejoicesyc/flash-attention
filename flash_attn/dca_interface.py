@@ -275,18 +275,18 @@ def flash_dca_with_kvcache(
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
 
-    if original_max_position_embeddings > 0:
-        mscale = (
-            0.1 *
-            torch.log(cache_seqlens / original_max_position_embeddings) +
-            1.0).clip(min=1)
-        query = (query * mscale.view(-1, 1, 1, 1)).to(
-            query.dtype
-        )  # possible for numerical issue, need to fused in the kernel
-        query_succ = (query_succ * mscale.view(-1, 1, 1, 1)).to(
-            query.dtype)
-        query_inter = (query_inter * mscale.view(-1, 1, 1, 1)).to(
-            query.dtype)
+    # if original_max_position_embeddings > 0:
+    #     mscale = (
+    #         0.1 *
+    #         torch.log(cache_seqlens / original_max_position_embeddings) +
+    #         1.0).clip(min=1)
+    #     query = (query * mscale.view(-1, 1, 1, 1)).to(
+    #         query.dtype
+    #     )  # possible for numerical issue, need to fused in the kernel
+    #     query_succ = (query_succ * mscale.view(-1, 1, 1, 1)).to(
+    #         query.dtype)
+    #     query_inter = (query_inter * mscale.view(-1, 1, 1, 1)).to(
+    #         query.dtype)
             
     out, softmax_lse = flash_attn_cuda.dca_kvcache(
         q,

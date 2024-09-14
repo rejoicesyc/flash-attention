@@ -899,6 +899,7 @@ void run_dca_fwd(Flash_dca_fwd_params &params, cudaStream_t stream, bool force_s
         DCA_HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.experimental_uniform_softmax, uniform_softmax, [&] {
                 // In prefill stage, we only use casual mask in intra-chunk and judge it during runtime
+                std::cout << "split num: " << params.num_splits << " force_split_kernel: " << force_split_kernel << std::endl;
                 if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
                     run_dca_fwd_<elem_type, kHeadDim, /*Is_causal*/true, uniform_softmax>(params, stream);
                 } else {
